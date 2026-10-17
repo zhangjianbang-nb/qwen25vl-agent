@@ -57,12 +57,12 @@ BLOB_BASES=(
 YUNET_BYTES=232589
 SFACE_BYTES=38696353
 
-# Retry aggressively, and treat a stalled transfer as a failure so curl re-issues the request
-# (resuming from where it stopped) instead of hanging for many minutes on a slow link.  This
-# network reaches the media endpoint at ~60 KB/s and drops the connection after a few MB, so
-# without these a 37 MB download never finishes in one run.
-CURL_OPTS=(-fL --connect-timeout 15 --retry 8 --retry-delay 3 --retry-all-errors
-           --speed-limit 1024 --speed-time 20)
+# Abort a stalled transfer quickly so the shell-level retry loop below can resume it.  curl's
+# own ``--retry`` is deliberately NOT used: on a ranged request it can restart the transfer from
+# zero, which throws away the bytes already on disk.  This network delivers a few MB from the
+# media endpoint and then stalls, so a single curl call rarely finishes a 37 MB file.
+CURL_OPTS=(-fL --connect-timeout 15 --speed-limit 1024 --speed-time 20)
+MAX_ATTEMPTS=20
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -97,13 +97,18 @@ fetch() {
     for base in "${BLOB_BASES[@]}"; do
         local url="${base}/opencv/opencv_zoo/main/${rel}"
 
-        if [[ -s "${tmp}" ]]; then
-            log "resume $(basename "${dest}") from $(file_size "${tmp}") bytes via ${base}"
-            curl "${CURL_OPTS[@]}" -C - -o "${tmp}" "${url}" || true
-        else
-            log "fetch  ${url}"
-            curl "${CURL_OPTS[@]}" -o "${tmp}" "${url}" || true
-        fi
+        # Retry in the shell, always resuming from whatever is already on disk.
+        local attempt
+        for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
+            if [[ -s "${tmp}" ]]; then
+                log "resume $(basename "${dest}") from $(file_size "${tmp}") bytes" \
+                    "(attempt ${attempt}/${MAX_ATTEMPTS}) via ${base}"
+            else
+                log "fetch  ${url} (attempt ${attempt}/${MAX_ATTEMPTS})"
+            fi
+            curl "${CURL_OPTS[@]}" -C - -o "${tmp}" "${url}" && break
+            sleep 2
+        done
 
         [[ -f "${tmp}" ]] || continue
 
