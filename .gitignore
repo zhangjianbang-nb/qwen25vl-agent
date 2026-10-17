@@ -1,0 +1,29 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Downloaded model weights.  These are fetched by `scripts/fetch_models.sh`, not committed:
+# SFace alone is ~37 MB and the ASR/voiceprint models live in the modelscope cache.
+# `*.part` is a download still in progress, which must never be committed either.
+models/*.onnx
+models/*.onnx.part
+models/*.part
+models/*.pt
+models/*.pth
+
+# Runtime state: the memory database, its archive, saved frames, and alert logs.  All of it
+# is per-machine and grows for as long as the agent runs, so none of it belongs in git.
+*.db
+*.db-wal
+*.db-shm
+archive/
+frames/
+*.log
+runs/
+
+# Local config overrides (the committed default lives in configs/default.yaml).
+configs/local*.yaml

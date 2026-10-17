@@ -1,0 +1,89 @@
+# Default configuration for the 24/7 camera monitoring agent.
+#
+# Every key here can be overridden on the command line (`qwen25vl-agent run --help`), and a
+# copy of this file can be pointed at with `--config`.  Values are grouped by the module that
+# reads them; see src/qwen25vl_agent/config.py for the exact fields.
+
+llm:
+  # A *running* qwen25vl-lite `serve` instance.  The agent never loads a second copy of the
+  # model: on an 8 GB card the served model already holds ~5.9 GB, so a second instance OOMs.
+  url: http://127.0.0.1:8081
+  model: Qwen2.5-VL-3B-Instruct
+  max_tokens: 256
+  temperature: 0.0
+  timeout: 120.0
+  # Vision budget is a *request-body* field (server `--vision-tier` does not change pixels).
+  # 128 tokens keeps a frame near the ~130 ms prefill floor while still describing a scene.
+  max_vision_tokens: 128
+  # Optional text-only OpenAI-compatible endpoint (e.g. lm-studio) used for the memory
+  # consolidation step, where no image is needed and a text model is cheaper.
+  text_url: null
+  text_model: null
+
+camera:
+  device: 0          # /dev/video<device>; 0 is the 640x480 capture node on this machine
+  width: 640         # request width from the driver
+  jpeg_quality: 85   # ~44 KB at 640x480 vs ~600 KB for PNG
+
+audio:
+  enabled: true
+  # `arecord -l` on this machine: card 1 (sof-hda-dsp) device 0 = analog mic, device 6 = DMIC.
+  device: "plughw:1,0"
+  rate: 16000
+  channels: 1
+  chunk_ms: 32
+  vad:
+    # Energy-based voice activity detection.  The floor adapts to the room, so these are
+    # starting points rather than fixed truths.
+    start_db: -32.0        # a chunk this far above the noise floor starts speech
+    hangover_ms: 400       # keep collecting this long after energy drops
+    min_speech_ms: 300     # discard shorter bursts as noise
+    max_segment_s: 20.0    # force-cut long speech so ASR stays responsive
+
+asr:
+  backend: funasr          # funasr | none
+  model: iic/SenseVoiceSmall
+  language: auto           # SenseVoice reports the spoken language; this drives 语言识别
+  use_itn: true            # inverse text normalization (numbers, punctuation)
+
+speaker:
+  backend: funasr          # funasr | none
+  model: iic/speech_campplus_sv_zh-cn_16k-common
+  threshold: 0.65          # cosine similarity above which two voiceprints are one person
+
+face:
+  detector_model: models/face_detection_yunet_2023mar.onnx
+  recognizer_model: models/face_recognition_sface_2021dec.onnx
+  detect_score: 0.6        # YuNet confidence threshold
+  match_threshold: 0.363   # SFace's published cosine threshold for "same identity"
+  min_face_px: 48          # ignore faces smaller than this (too small to embed reliably)
+
+identity:
+  # How to fuse the two modalities when deciding whether an observation is a known person.
+  # "any"   -> match on face OR voice
+  # "both"  -> require both (stricter; good when both are reliably present)
+  # "prefer_face" -> use face when available, else voice
+  mode: prefer_face
+
+monitor:
+  tick_interval: 0.5         # perception cadence (face detect + working memory)
+  describe_interval: 12.0    # seconds between VL "scene" calls; a frame costs ~0.6 s
+  describe_on_event: true    # also call the VL model when a new/unknown face or speech arrives
+  min_describe_gap: 2.0      # floor between two VL calls, even when events fire
+  save_frames: true          # archive the frame that each episode points at
+  frame_retention_days: 3
+
+memory:
+  path: ~/.qwen25vl-agent/memory.db
+  archive_dir: ~/.qwen25vl-agent/archive
+  working_size: 40           # observations kept in the in-process ring buffer
+  working_ttl_s: 300.0
+  episode_retention_days: 30
+  observation_retention_days: 7
+  # Cap the on-disk archive so a 24/7 run cannot fill the disk.
+  archive_max_mb: 2048
+
+alerts:
+  webhook: null              # optional POST target; nothing is sent unless set
+  log_path: ~/.qwen25vl-agent/alerts.log
+  min_importance: 0.5        # procedural rules below this are recorded, not alerted
