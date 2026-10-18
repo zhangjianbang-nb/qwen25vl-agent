@@ -39,10 +39,18 @@ def test_detection_area_and_dict():
     assert detection.as_dict(with_embedding=True)["embedding_dim"] == 128
 
 
-def test_models_present_reports_both_files(cfg):
-    assert FaceEngine.models_present(cfg.detector_model_path, cfg.recognizer_model_path) is True
-    assert FaceEngine.models_present("/definitely/not/here.onnx",
-                                    cfg.recognizer_model_path) is False
+def test_models_present_reports_both_files(tmp_path):
+    # The real models are gitignored (`scripts/fetch_models.sh` downloads them), so this test
+    # uses stand-in files: the helper only answers "are both paths files", and a suite that
+    # needed the 37 MB downloads would be red on a fresh clone and on CI.
+    detector = tmp_path / "detector.onnx"
+    recognizer = tmp_path / "recognizer.onnx"
+    detector.write_bytes(b"stand-in")
+    recognizer.write_bytes(b"stand-in")
+
+    assert FaceEngine.models_present(str(detector), str(recognizer)) is True
+    assert FaceEngine.models_present("/definitely/not/here.onnx", str(recognizer)) is False
+    assert FaceEngine.models_present(str(detector), "/definitely/not/here.onnx") is False
 
 
 def test_engine_loads_and_finds_nothing_on_a_blank_frame(cfg):
