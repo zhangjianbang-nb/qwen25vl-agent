@@ -95,6 +95,28 @@ def test_empty_reply_is_not_ok():
     assert decision.scene == ""
 
 
+def test_a_truncated_reply_is_reported_not_parsed():
+    """A reply cut off by ``max_tokens`` must not be salvaged as a nested fragment.
+
+    The old parser skipped to the next ``{`` when the outer object never closed, found a balanced
+    inner object, and returned ``ok=True`` with an empty scene -- so the description was silently
+    thrown away and the tick looked successful.
+    """
+    truncated = ('{\n  "scene": "画面中出现1张未知人脸",\n'
+                 '  "people": [{"name": "unknown", "action": "出现"},')
+    decision = parse_decision(truncated)
+    assert not decision.ok
+    assert "truncated" in decision.error
+    assert decision.scene == ""            # nothing is recorded, and the failure is visible
+
+
+def test_a_fenced_but_truncated_reply_is_also_reported():
+    decision = parse_decision('```json\n{"scene": "x", "people": [{"name": "y"')
+    assert not decision.ok
+    assert "truncated" in decision.error
+    assert decision.scene == ""
+
+
 def test_decision_as_dict_round_trips_keys():
     decision = Decision(scene="s", events=[{"importance": 0.4}])
     payload = decision.as_dict()

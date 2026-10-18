@@ -24,6 +24,34 @@ from .working import WorkingMemory
 __all__ = ["Memory", "MemoryStore", "WorkingMemory", "EpisodicMemory", "SemanticMemory",
            "ProceduralMemory", "PersonMemory", "Archiver"]
 
+# How many episodes of each kind may enter the agent's context.  ``recent()`` returns the newest
+# rows, and in practice one kind dominates: a person standing in frame writes 'face' rows, and ten
+# of them crowd out every scene and alert.  A per-kind cap keeps the slice diverse, which is what
+# the model needs to describe the current frame instead of echoing one repeated line back.
+_EPISODE_CAPS = {"scene": 4, "face": 2, "alert": 3}
+_EPISODE_CAP_DEFAULT = 2
+
+
+def select_episodes(episodic: "EpisodicMemory", limit: int) -> List[Dict[str, Any]]:
+    """Newest episodes for the prompt, deduplicated and capped per kind."""
+    rows = episodic.recent(limit=max(limit * 4, 20))
+    seen: set = set()
+    per_kind: Dict[str, int] = {}
+    out: List[Dict[str, Any]] = []
+    for episode in rows:                       # newest first
+        key = (episode.kind, episode.summary)
+        if key in seen:
+            continue
+        cap = _EPISODE_CAPS.get(episode.kind, _EPISODE_CAP_DEFAULT)
+        if per_kind.get(episode.kind, 0) >= cap:
+            continue
+        seen.add(key)
+        per_kind[episode.kind] = per_kind.get(episode.kind, 0) + 1
+        out.append(episode.as_dict())
+        if len(out) >= limit:
+            break
+    return out
+
 
 class Memory:
     """All five memories over one SQLite file."""
@@ -94,7 +122,7 @@ class Memory:
                 }
                 for p in self.person.all()
             ],
-            "recent_episodes": [e.as_dict() for e in self.episodic.recent(limit=episodes)],
+            "recent_episodes": select_episodes(self.episodic, episodes),
             "facts": [f.sentence() for f in self.semantic.get(limit=facts)],
             "working": self.working.snapshot(working),
             "rules": [r.name for r in self.procedural.all(enabled_only=True)],

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import signal
 import threading
 import time
@@ -37,6 +38,8 @@ from .perception.audio import AudioCapture, AudioUnavailable
 from .perception.face import FaceEngine, FaceUnavailable
 from .perception.vad import EnergyVAD
 from .perception.video import CameraSource
+from .summary import SUMMARY_KIND, HourlySummarizer
+from .tts import make_engine
 
 __all__ = ["Monitor", "MonitorEvent"]
 
@@ -73,15 +76,38 @@ class _Utterance:
     voice_embedding: Any = None
 
 
+# The energy VAD fires on loudness, not on "is this speech", so room noise and music reach the
+# ASR model -- which then invents a short filler ("Yeah.", "I.", ".").  Those carry no content,
+# and once speech is handed to the agent they would only dilute its prompt, so they are dropped
+# from working memory and from the agent's input while the raw observation log keeps them.
+_NOISE_WORDS = {
+    "yeah", "yes", "yep", "ok", "okay", "oh", "uh", "um", "hmm", "hm", "ah", "eh",
+    "i", "a", "the", "and", "so", "ha", "huh",
+    "嗯", "啊", "哦", "呃", "唔", "额",
+}
+
+
+def _is_noise_transcript(text: str) -> bool:
+    """True for ASR artifacts with no content: pure punctuation, or a lone filler word."""
+    norm = re.sub(r"[^\w\u4e00-\u9fff]+", "", text or "").lower()
+    if len(norm) < 2:
+        return True
+    return norm in _NOISE_WORDS
+
+
 class Monitor:
     def __init__(self, cfg: Config, *, memory: Optional[Memory] = None,
                  camera: Optional[CameraSource] = None,
                  face: Optional[FaceEngine] = None,
                  asr: Optional[Any] = None, speaker: Optional[Any] = None,
-                 agent: Optional[Agent] = None) -> None:
+                 agent: Optional[Agent] = None,
+                 summarizer: Optional[Any] = None,
+                 tts: Optional[Any] = None) -> None:
         self.cfg = cfg
         self.memory = memory or Memory(cfg, frames_dir=cfg.frames_dir)
-        self.camera = camera or CameraSource(device=cfg.camera.device, width=cfg.camera.width)
+        self.camera = camera or CameraSource(
+            device=cfg.camera.device, width=cfg.camera.width, rotate=cfg.camera.rotate,
+        )
         self.face = face or FaceEngine(
             cfg.detector_model_path, cfg.recognizer_model_path,
             detect_score=cfg.face.detect_score, min_face_px=cfg.face.min_face_px,
@@ -89,6 +115,11 @@ class Monitor:
         self.asr = asr
         self.speaker = speaker
         self.agent = agent or Agent(cfg)
+        self.summarizer = summarizer or HourlySummarizer(cfg, self.agent)
+        # A TTS engine that is unavailable comes back as None, which is the same as "don't speak".
+        self.tts = tts if tts is not None else make_engine(
+            cfg, on_error=lambda msg: self._emit(MonitorEvent(time.time(), "error", f"tts: {msg}"))
+        )
 
         self._face_ready = False
         self._stop = threading.Event()
@@ -96,14 +127,18 @@ class Monitor:
         self._audio_thread: Optional[threading.Thread] = None
         self._recent_voices: List[Dict[str, Any]] = []
         self._last_speech_ts: Optional[float] = None
+        self._identity_key: tuple = ()          # who was in frame last tick, for change detection
         self._last_describe = 0.0
         self._last_archive = 0.0
+        self._last_summary = 0.0
         self._started_ts = 0.0
         self._pending_event = False
         self._frame_counter = 0
+        self._latest_rgb: Any = None        # newest frame, for a web preview (encoded on demand)
         self._stats: Dict[str, Any] = {
             "ticks": 0, "frames": 0, "describes": 0, "describe_errors": 0,
-            "faces": 0, "utterances": 0, "alerts": 0, "episodes": 0,
+            "faces": 0, "utterances": 0, "noise": 0, "alerts": 0, "episodes": 0,
+            "summaries": 0, "summary_errors": 0, "spoken": 0,
         }
         self._listeners: List[Callable[[MonitorEvent], None]] = []
 
@@ -122,6 +157,9 @@ class Monitor:
         os.makedirs(self.cfg.frames_dir, exist_ok=True)
         os.makedirs(os.path.dirname(self.cfg.alert_log) or ".", exist_ok=True)
         self._started_ts = time.time()
+        # Start the summary clock at startup, so the first broadcast lands one interval in rather
+        # than firing immediately against an empty window.
+        self._last_summary = self._started_ts
 
         # Face models are optional: without them the agent still describes scenes.
         if self.face.models_present(self.cfg.detector_model_path, self.cfg.recognizer_model_path):
@@ -158,6 +196,8 @@ class Monitor:
             rate=self.cfg.audio.rate,
         )
         backoff = 1.0
+        silent = 0
+        warned_silence = False
         while not self._stop.is_set():
             try:
                 capture.start()
@@ -165,11 +205,29 @@ class Monitor:
                 self._emit(MonitorEvent(time.time(), "error", f"audio unavailable: {exc}"))
                 return
 
+            silent = 0
+            warned_silence = False
             try:
                 while not self._stop.is_set():
                     chunk = capture.read_float()
                     if chunk is None:            # arecord exited; re-open below
                         break
+
+                    # A capture device can open cleanly and still hand back pure digital silence
+                    # -- a mixer switch left off, or nothing plugged in.  Without this check the
+                    # agent simply looks deaf, so say so once instead of failing quietly.
+                    if chunk.size and not chunk.any():
+                        silent += 1
+                        if not warned_silence and silent >= 50:      # ~1.6 s at chunk_ms=32
+                            warned_silence = True
+                            self._emit(MonitorEvent(
+                                time.time(), "error",
+                                "microphone returns digital silence (all-zero samples); "
+                                "check the capture switch, e.g. `amixer -c 1 cset numid=63 on`",
+                            ))
+                    else:
+                        silent = 0
+
                     segment = vad.push(chunk, time.time())
                     if segment is None:
                         continue
@@ -218,15 +276,20 @@ class Monitor:
             pass    # the main thread is behind; dropping an utterance is better than blocking
 
     # -- main thread helpers ---------------------------------------------------------
-    def _drain_speech(self, now: float) -> List[_Utterance]:
-        """Consume utterances from the audio thread and match/record them here."""
-        out: List[_Utterance] = []
+    def _drain_speech(self, now: float) -> List[Dict[str, Any]]:
+        """Consume utterances from the audio thread and match/record them here.
+
+        Returns the content-bearing utterances of this tick, already reduced to the fields the
+        agent needs, so the caller can hand them straight to the model.  ASR artifacts (a lone
+        "Yeah." or ".") are still written to the raw observation log -- that record stays faithful
+        -- but they are kept out of working memory and out of the agent's prompt.
+        """
+        out: List[Dict[str, Any]] = []
         while True:
             try:
                 item = self._speech_q.get_nowait()
             except queue.Empty:
                 break
-            out.append(item)
 
             match = self.memory.person.fuse(voice_vec=item.voice_embedding) \
                 if item.voice_embedding is not None else None
@@ -239,6 +302,11 @@ class Monitor:
                          "speaker_name": speaker_name, "known": bool(match and match.known)},
                 person_ids=person_ids,
             )
+
+            if _is_noise_transcript(item.text):
+                self._stats["noise"] += 1
+                continue
+
             self.memory.working.add(
                 "speech", item.text, ts=item.ts,
                 language=item.language, speaker_name=speaker_name,
@@ -260,17 +328,30 @@ class Monitor:
             self._emit(MonitorEvent(item.ts, "speech",
                                     f"[{speaker_name}] {item.text}",
                                     data={"language": item.language}))
+            out.append({"text": item.text, "language": item.language,
+                        "speaker_name": speaker_name, "ts": item.ts})
 
         cutoff = now - 10.0
         self._recent_voices = [v for v in self._recent_voices if v["ts"] >= cutoff]
         return out
 
     def _identities(self, faces: List[Any], now: float) -> List[Dict[str, Any]]:
-        """Fuse face matches with voice matches from the same time window."""
+        """Fuse face matches with voice matches from the same time window.
+
+        One person detected twice in a single frame is still one identity, so a second detection
+        that resolves to a person already listed is dropped.  Two *unknown* detections are kept:
+        they may genuinely be two different people nobody has enrolled.
+        """
         identities: List[Dict[str, Any]] = []
+        seen_person_ids: set = set()
         for face in faces:
             match = self.memory.person.match_face(face.embedding) if face.embedding is not None \
                 else None
+            person_id = match.person_id if (match and match.known) else None
+            if person_id is not None and person_id in seen_person_ids:
+                continue
+            if person_id is not None:
+                seen_person_ids.add(person_id)
             entry: Dict[str, Any] = {
                 "box": [int(v) for v in face.box],
                 "det_score": round(float(face.score), 3),
@@ -278,6 +359,7 @@ class Monitor:
                 "name": match.name if (match and match.known) else "unknown",
                 "score": round(match.score, 4) if match else 0.0,
                 "modality": "face",
+                "person_id": person_id,
             }
             if match and match.known:
                 # If a voice in the last 10 s matched the same person, the identity is confirmed
@@ -290,6 +372,48 @@ class Monitor:
                 self.memory.person.touch(match.person_id, ts=now)
             identities.append(entry)
         return identities
+
+    def _record_face_presence(self, identities: List[Dict[str, Any]], now: float) -> None:
+        """Record a "who is in frame" episode whenever the set of faces changes.
+
+        Faces are one of the three timestamped streams the hourly summary reads, but the raw
+        per-tick observation log is far too dense to summarize -- at a 0.5 s tick an hour is
+        7200 rows.  Writing only on *change* keeps it cheap, and a repeat of the same set within
+        ``face_presence_merge_s`` extends the previous episode rather than writing a near-duplicate
+        row: a detector that flickers on a blurry frame would otherwise fill episodic memory with
+        one identical "1张未知人脸" line after another, crowding out every scene and alert.
+        """
+        names = tuple(sorted({str(i.get("name") or "unknown") for i in identities}))
+        if names == self._identity_key:
+            return
+        self._identity_key = names
+        if not names:                      # nobody in frame is the quiet default, not an event
+            return
+
+        known = [name for name in names if name != "unknown"]
+        unknown = len(names) - len(known)
+        parts: List[str] = []
+        if known:
+            parts.append("、".join(known))
+        if unknown:
+            parts.append(f"{unknown}张未知人脸")
+        summary = "画面中出现：" + "，".join(parts)
+
+        recent = self.memory.episodic.recent(limit=1, kind="face")
+        if recent:
+            last = recent[0]
+            if last.summary == summary and (now - last.ts) < self.cfg.monitor.face_presence_merge_s:
+                self.memory.episodic.extend(last.id, t_end=now)
+                return
+
+        person_ids: List[int] = []
+        for name in known:
+            person = self.memory.person.get(name)
+            if person is not None:
+                person_ids.append(person.id)
+
+        self.memory.episodic.record("face", summary, ts=now, person_ids=sorted(set(person_ids)))
+        self._emit(MonitorEvent(now, "person", summary))
 
     def _save_frame(self, rgb, now: float) -> Optional[str]:
         if not self.cfg.monitor.save_frames:
@@ -375,8 +499,10 @@ class Monitor:
         ctx = TickContext(
             ts=now,
             identities=identities,
-            speech=[{"text": u.text, "language": u.language,
-                     "speaker_name": (self._recent_voices[-1]["name"] if self._recent_voices else "unknown")}
+            # WorkingItem carries the speech metadata in ``data``, not as top-level attributes.
+            speech=[{"text": u.text,
+                     "language": u.data.get("language", "unknown"),
+                     "speaker_name": u.data.get("speaker_name", "unknown")}
                     for u in self.memory.working.recent(kind="speech", n=5)],
             last_speech_ts=self._last_speech_ts,
             person_last_seen={p.name: (p.last_seen or 0.0) for p in self.memory.person.all()},
@@ -480,6 +606,8 @@ class Monitor:
             self._stop.set()
             if self._audio_thread is not None:
                 self._audio_thread.join(timeout=3.0)
+            if self.tts is not None:
+                self.tts.close()
             self.camera.close()
             self.memory.close()
             for sig, handler in previous.items():
@@ -500,11 +628,13 @@ class Monitor:
             self._emit(MonitorEvent(now, "error", "camera returned no frame"))
             return
         self._stats["frames"] += 1
+        self._latest_rgb = frame.rgb          # for a live preview; the web thread encodes it
 
         faces = self.face.analyze(frame.rgb) if self._face_ready else []
         self._stats["faces"] += len(faces)
-        self._drain_speech(now)
+        utterances = self._drain_speech(now)
         identities = self._identities(faces, now)
+        self._record_face_presence(identities, now)
 
         # Record what was seen even when the agent is not called, so the raw log is complete.
         self.memory.episodic.observe(
@@ -524,7 +654,7 @@ class Monitor:
             # database can always be checked against what the camera saw.
             frame_path = self._save_frame(frame.rgb, now)
             obs = Observation(ts=now, frame_jpeg=jpeg, faces=identities,
-                              speech=[], frame_path=frame_path)
+                              speech=utterances, frame_path=frame_path)
             decision = self.agent.decide(obs, self.memory.context())
             self._last_describe = now
             self._pending_event = False
@@ -546,10 +676,76 @@ class Monitor:
             except Exception as exc:
                 self._emit(MonitorEvent(now, "error", f"archive failed: {exc}"))
 
+        # Hourly spoken summary.  Separate clock from the archive so a slow archive cannot push
+        # the broadcast around, and so the two can be tuned independently.
+        if self._summary_due(now):
+            self._note_summary(now, ok=self._hourly_summary(now))
+
+    def _summary_due(self, now: float) -> bool:
+        return self.cfg.summary.enabled and now - self._last_summary >= self.cfg.summary.interval_s
+
+    def _note_summary(self, now: float, *, ok: bool) -> None:
+        """Advance the broadcast clock -- on success only, by the full interval.
+
+        A failed broadcast used to consume the whole hour, so a transient timeout meant an hour
+        of silence and no hint that anything had gone wrong.  On failure the clock is rewound to
+        ``retry_s`` in the future instead, which keeps a permanently broken setup from hammering
+        the engine every tick while still recovering within minutes.
+        """
+        if ok:
+            self._last_summary = now
+        else:
+            self._last_summary = now - self.cfg.summary.interval_s + self.cfg.summary.retry_s
+
+    def _hourly_summary(self, now: float) -> bool:
+        """Distill the last hour into a sentence or two, then read it aloud.
+
+        The result is written back to episodic memory under ``hourly_summary``, which the next
+        window excludes -- otherwise each broadcast would summarize the previous broadcast.
+
+        Returns False only for a real failure.  A quiet hour is a success: there is nothing to
+        say, and retrying it in five minutes would not change that.
+        """
+        try:
+            result = self.summarizer.summarize(self.memory, now)
+        except Exception as exc:      # a bad summary must not end a 24/7 run
+            self._stats["summary_errors"] += 1
+            self._emit(MonitorEvent(now, "error", f"summary failed: {exc}"))
+            return False
+
+        if not result.ok:
+            self._stats["summary_errors"] += 1
+            self._emit(MonitorEvent(now, "error", f"summary failed: {result.error}"))
+            return False
+        if result.quiet:
+            self._emit(MonitorEvent(now, "summary", "本小时无内容，跳过播报",
+                                    data={"quiet": True, "items": result.items}))
+            return True
+
+        self._stats["summaries"] += 1
+        self.memory.episodic.record(
+            SUMMARY_KIND, result.text, ts=now,
+            detail={"items": result.items, "window_s": result.window_s},
+        )
+        self._emit(MonitorEvent(now, "summary", result.text, data={"items": result.items}))
+
+        if self.cfg.summary.speak and self.tts is not None:
+            if self.tts.say_async(result.text):
+                self._stats["spoken"] += 1
+        return True
+
     # -- introspection ---------------------------------------------------------------
     @property
     def stats(self) -> Dict[str, Any]:
         return dict(self._stats)
+
+    def latest_rgb(self) -> Any:
+        """The most recent frame as RGB, or ``None`` before the first tick.
+
+        A live preview reads this rather than opening a second ``VideoCapture``: the monitor owns
+        the camera for the whole run, and two readers on one V4L2 device would fight over it.
+        """
+        return self._latest_rgb
 
     def stop(self) -> None:
         self._stop.set()

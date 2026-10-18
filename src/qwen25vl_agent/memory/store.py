@@ -146,7 +146,14 @@ class MemoryStore:
     def connect(self) -> sqlite3.Connection:
         if self._conn is not None:
             return self._conn
-        conn = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
+        # ``check_same_thread=False`` because the connection is *handed off*, not shared: the
+        # monitor is built on the main thread but runs on its own thread (that is how
+        # ``qwen25vl-agent web`` streams events while serving HTTP), so the connection is created
+        # in one thread and used in another.  Ownership is still single-threaded -- the web
+        # frontend opens its own short-lived connections for reads -- so nothing uses this one
+        # concurrently.  Without the flag SQLite raises on the very first tick.
+        conn = sqlite3.connect(self.path, timeout=30.0, isolation_level=None,
+                               check_same_thread=False)
         conn.row_factory = sqlite3.Row
         # WAL so the CLI can read memory while the agent writes; NORMAL sync because losing the
         # last second of a monitoring log on a power cut is acceptable, and FULL would fsync on

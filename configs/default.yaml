@@ -15,27 +15,38 @@ llm:
   # Vision budget is a *request-body* field (server `--vision-tier` does not change pixels).
   # 128 tokens keeps a frame near the ~130 ms prefill floor while still describing a scene.
   max_vision_tokens: 128
-  # Optional text-only OpenAI-compatible endpoint (e.g. lm-studio) used for the memory
-  # consolidation step, where no image is needed and a text model is cheaper.
-  text_url: null
-  text_model: null
+  # Text-only OpenAI-compatible endpoint used for the hourly summary, where no image is needed.
+  # On this machine that is a locally served Qwen3.5-4B (see scripts/serve_qwen35.sh): the VL
+  # model stays on the card describing frames, and the summary runs on CPU where there is room.
+  # Set to null to fall back to the vision engine for summaries as well.
+  text_url: http://127.0.0.1:8082
+  text_model: Qwen3.5-4B
 
 camera:
   device: 0          # /dev/video<device>; 0 is the 640x480 capture node on this machine
   width: 640         # request width from the driver
   jpeg_quality: 85   # ~44 KB at 640x480 vs ~600 KB for PNG
+  # Degrees clockwise to rotate each frame before face detection and the VL model see it.
+  # This machine's camera is mounted upside-down: the frame looks plausible either way, but
+  # YuNet detects 0 faces on the raw frame and 1 face (0.82) on the 180-rotated one, and the
+  # VL model reads the inverted scene as "blurry, nothing recognisable".  0/90/180/270.
+  rotate: 180
 
 audio:
   enabled: true
-  # `arecord -l` on this machine: card 1 (sof-hda-dsp) device 0 = analog mic, device 6 = DMIC.
-  device: "plughw:1,0"
+  # `arecord -l` on this machine: card 1 (sof-hda-dsp) device 0 = analog jack, device 6 = DMIC.
+  # Measured here: the analog jack is empty (`Mic Jack` = off) and yields -87 dBFS of ADC noise,
+  # while the internal DMIC array hears the room at -50 dBFS -- so DMIC is the working input.
+  # NOTE: `Dmic0 Capture Switch` must be on, or the DMIC returns digital silence (all zeros):
+  #   amixer -c 1 cset numid=63 on
+  device: "plughw:1,6"
   rate: 16000
   channels: 1
   chunk_ms: 32
   vad:
-    # Energy-based voice activity detection.  The floor adapts to the room, so these are
-    # starting points rather than fixed truths.
-    start_db: -32.0        # a chunk this far above the noise floor starts speech
+    # Energy-based voice activity detection.  Thresholds come from a loopback measurement on
+    # this machine: room floor -50 dBFS, speech through the speakers -18..-44 dBFS.
+    start_db: -40.0        # a chunk this far above the floor starts speech
     hangover_ms: 400       # keep collecting this long after energy drops
     min_speech_ms: 300     # discard shorter bursts as noise
     max_segment_s: 20.0    # force-cut long speech so ASR stays responsive
@@ -72,6 +83,10 @@ monitor:
   min_describe_gap: 2.0      # floor between two VL calls, even when events fire
   save_frames: true          # archive the frame that each episode points at
   frame_retention_days: 3
+  # The same set of people may vanish and return within this window and still count as one
+  # presence episode (its end time is pushed forward instead of a near-duplicate row being
+  # written).  Keeps flickering detections from flooding episodic memory.
+  face_presence_merge_s: 300.0
 
 memory:
   path: ~/.qwen25vl-agent/memory.db
@@ -87,3 +102,32 @@ alerts:
   webhook: null              # optional POST target; nothing is sent unless set
   log_path: ~/.qwen25vl-agent/alerts.log
   min_importance: 0.5        # procedural rules below this are recorded, not alerted
+
+summary:
+  enabled: true
+  interval_s: 3600.0         # one broadcast per hour
+  window_s: 3600.0           # how much memory it reads each time
+  max_items: 200             # cap the rows pulled from memory
+  min_items: 1               # a window this empty is skipped rather than announced as "nothing"
+  retry_s: 300.0             # a failed broadcast is retried after this long, not a whole hour
+  speak: true                # read the summary aloud
+
+tts:
+  enabled: true
+  # auto -> piper, else edge-tts, else espeak-ng, else spd-say.  `edge` needs the network at
+  # speak time but gives the best Chinese; `piper` is offline but needs a voice .onnx.
+  backend: auto
+  voice: zh-CN-XiaoxiaoNeural   # edge voice name; for backend=piper this is the .onnx path
+  player: auto                  # auto -> pw-play, paplay, ffplay, aplay
+  rate: "+0%"
+  espeak_voice: cmn             # used only by backend=espeak
+  max_chars: 400                # keep one broadcast short
+  timeout: 60.0
+  command: null                 # backend=command: shell template with {text} and {out}
+
+web:
+  # The optional frontend (`qwen25vl-agent web`).  8090 keeps clear of the vision server (8081)
+  # and the text server (8082).  host stays on loopback: the UI can enroll people and trigger
+  # speech, so it should not be reachable from the LAN unless you mean it.
+  host: 127.0.0.1
+  port: 8090

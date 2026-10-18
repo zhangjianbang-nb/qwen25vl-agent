@@ -58,6 +58,11 @@ class EnergyVAD:
     min_speech_ms: int = 300
     max_segment_s: float = 20.0
     rate: int = 16000
+    # Second gate, applied to the whole segment's peak.  ``start_db`` is deliberately low so a
+    # soft speech onset is not missed, but that same low threshold lets room noise start a
+    # segment -- and a segment of noise transcribed is how a quiet room comes back as chatter.
+    # A segment whose loudest chunk never reached this is dropped.
+    min_peak_db: float = -120.0
 
     _buf: List[np.ndarray] = field(default_factory=list, repr=False)
     _in_speech: bool = False
@@ -115,6 +120,8 @@ class EnergyVAD:
             return None
         if segment.audio.size == 0:
             return None
+        if self._peak_db < self.min_peak_db:
+            return None
         return segment
 
     def flush(self) -> Optional[Segment]:
@@ -125,4 +132,6 @@ class EnergyVAD:
         segment = Segment(audio=audio, start_ts=self._start_ts,
                           end_ts=self._last_voice_ts or self._start_ts, peak_db=self._peak_db)
         self.reset()
-        return segment if segment.audio.size else None
+        if segment.audio.size == 0 or segment.peak_db < self.min_peak_db:
+            return None
+        return segment

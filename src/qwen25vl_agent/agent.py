@@ -29,18 +29,20 @@ SYSTEM_PROMPT = """你是一个 24 小时摄像头监控智能体。每次你会
 只输出一个 JSON 对象，不要输出任何解释或多余文字，格式严格如下：
 {
   "scene": "对当前画面的简短客观描述，一句话",
-  "people": [{"name": "已知人物名或 unknown", "action": "此人正在做什么"}],
+  "people": [{"name": "已知人物名", "action": "此人正在做什么"}],
   "events": [{"kind": "事件类型", "summary": "一句话描述", "importance": 0.0}],
   "remember": [{"subject": "主语", "predicate": "关系", "object": "宾语", "confidence": 0.0}],
   "notes": [{"name": "人物名", "text": "值得记入该人物档案的一句话"}]
 }
 
 规则：
-- 只描述你确实看到或听到的内容，不要推测，不要编造人名；
-- 人脸结果里标为 unknown 的，name 一律写 unknown；
+- scene 只描述【当前感知】这一帧里你确实看到的东西：物体、位置、动作、光线、画面清晰度。
+  禁止复述【近期情景记忆】里的句子，也不要写"出现了几张人脸"这种识别结果；
+- people 只填【已知人物】里出现过的名字（最多 5 个），不要写 unknown，不要重复；
+  没有已知人物时返回空数组 []；
 - 没有事件时 events 返回空数组 []；没有可记忆内容时 remember / notes 返回空数组；
 - importance 取值 0.0~1.0，越高越需要提醒（0.0 表示日常，0.9 表示异常）；
-- 只输出 JSON，不要加 ``` 代码块。"""
+- 输出要短，只输出 JSON，不要加 ``` 代码块。"""
 
 
 @dataclass
@@ -108,31 +110,37 @@ _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
 def _first_json_object(text: str) -> Optional[str]:
-    """Return the first balanced ``{...}`` block, ignoring braces inside strings."""
+    """Return the balanced ``{...}`` block that starts at the first ``{``, or ``None``.
+
+    Only the first ``{`` is tried.  The output contract is a single JSON object, so if that object
+    is unterminated -- a reply cut off by ``max_tokens`` -- the honest answer is "no JSON", not a
+    *nested* fragment that happens to be balanced.  Returning the nested piece would parse fine
+    and hand back an empty scene, silently discarding the description instead of reporting it.
+    """
     start = text.find("{")
-    while start != -1:
-        depth = 0
-        in_string = False
-        escaped = False
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-                continue
-            if ch == '"':
-                in_string = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start:i + 1]
-        start = text.find("{", start + 1)
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
     return None
 
 
@@ -147,13 +155,23 @@ def parse_decision(text: str) -> Decision:
     if candidate is None:
         candidate = _first_json_object(raw)
     if candidate is None:
+        if "{" in raw:
+            # An object was opened but never closed: the reply was truncated by ``max_tokens``.
+            # Report it instead of pretending the tick succeeded with nothing recorded.
+            return Decision(scene="", raw=raw, ok=False,
+                            error="incomplete JSON object (reply likely truncated)")
         # No JSON at all: keep the prose as the scene so the tick still carries information.
         return Decision(scene=raw, raw=raw, ok=False, error="no JSON object in reply")
 
     try:
         data = json.loads(candidate)
     except ValueError as exc:
-        return Decision(scene=raw, raw=raw, ok=False, error=f"invalid JSON: {exc}")
+        truncated = candidate.lstrip().startswith("{") and not candidate.rstrip().endswith("}")
+        return Decision(
+            scene="" if truncated else raw, raw=raw, ok=False,
+            error="incomplete JSON object (reply likely truncated)" if truncated
+            else f"invalid JSON: {exc}",
+        )
 
     if not isinstance(data, dict):
         return Decision(scene=raw, raw=raw, ok=False, error="JSON was not an object")
@@ -198,6 +216,11 @@ class Agent:
                                             timeout=cfg.llm.timeout)
 
     # -- prompt --------------------------------------------------------------------
+    @property
+    def text_client(self) -> Optional[LLMClient]:
+        """The text-only endpoint (``llm.text_url``), or None when only vision is configured."""
+        return self._text_client
+
     def build_prompt(self, observation: Observation, context: Dict[str, Any]) -> str:
         parts: List[str] = []
 

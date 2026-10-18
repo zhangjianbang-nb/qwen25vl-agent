@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qwen25vl-agent"
 version = "0.1.0"
-description = "A 24/7 camera monitoring agent: video + speech + face perception, Qwen2.5-VL reasoning, and a five-part multimodal memory"
+description = "A 24/7 camera monitoring agent: video + speech + face perception, Qwen2.5-VL reasoning, a five-part multimodal memory, and an hourly Qwen3.5-4B spoken summary"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
@@ -44,6 +44,10 @@ Engine = "https://github.com/zhangjianbang-nb/qwen25vl-lite"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The web UI is one self-contained HTML file served from disk, so it has to ship with the package.
+[tool.setuptools.package-data]
+"qwen25vl_agent.webui" = ["*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

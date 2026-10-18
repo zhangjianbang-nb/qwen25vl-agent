@@ -2,7 +2,8 @@
 
 Subcommands, grouped by what the operator is doing:
 
-* watching -- ``run`` (the 24/7 loop), ``selftest`` (a short end-to-end check)
+* watching -- ``run`` (the 24/7 loop), ``web`` (the same loop behind a local web frontend),
+  ``selftest`` (a short end-to-end check)
 * enrolling -- ``enroll`` (face + voice), ``voiceprint`` (compare or enroll a voice)
 * inspecting -- ``persons``, ``mem``, ``rules``, ``transcribe``
 * diagnosing -- ``doctor``
@@ -44,13 +45,26 @@ def _overrides(args: argparse.Namespace) -> Dict[str, Any]:
     put("llm", "max_vision_tokens", getattr(args, "max_vision_tokens", None))
     put("llm", "timeout", getattr(args, "timeout", None))
     put("llm", "max_tokens", getattr(args, "max_tokens", None))
+    put("llm", "text_url", getattr(args, "text_url", None))
+    put("llm", "text_model", getattr(args, "text_model", None))
     put("camera", "device", getattr(args, "device", None))
     put("camera", "width", getattr(args, "width", None))
+    put("camera", "rotate", getattr(args, "rotate", None))
     put("camera", "jpeg_quality", getattr(args, "jpeg_quality", None))
     put("monitor", "tick_interval", getattr(args, "interval", None))
     put("monitor", "describe_interval", getattr(args, "describe_interval", None))
     put("monitor", "save_frames", getattr(args, "save_frames", None))
     put("memory", "path", getattr(args, "db", None))
+    put("summary", "interval_s", getattr(args, "summary_interval", None))
+    put("summary", "window_s", getattr(args, "summary_window", None))
+    put("summary", "speak", getattr(args, "speak", None))
+    put("tts", "backend", getattr(args, "tts_backend", None))
+    put("tts", "voice", getattr(args, "tts_voice", None))
+    put("tts", "player", getattr(args, "tts_player", None))
+    if getattr(args, "no_summary", False):
+        out.setdefault("summary", {})["enabled"] = False
+    if getattr(args, "no_tts", False):
+        out.setdefault("tts", {})["enabled"] = False
     if getattr(args, "no_audio", False):
         out.setdefault("audio", {})["enabled"] = False
     put("audio", "device", getattr(args, "audio_device", None))
@@ -145,6 +159,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"[{stamp}] SPEECH {event.message}", flush=True)
         elif event.kind == "scene":
             print(f"[{stamp}] SCENE {event.message}", flush=True)
+        elif event.kind == "summary":
+            print(f"[{stamp}] SUMMARY {event.message}", flush=True)
+        elif event.kind == "person":
+            print(f"[{stamp}] PERSON {event.message}", flush=True)
         elif event.kind == "error":
             print(f"[{stamp}] ERROR {event.message}", file=sys.stderr, flush=True)
         elif event.kind == "tick" and args.verbose:
@@ -154,6 +172,40 @@ def cmd_run(args: argparse.Namespace) -> int:
     ticks = monitor.run(max_ticks=args.max_ticks, duration_s=args.duration)
     if not json_out:
         print(f"\nstopped after {ticks} ticks: {json.dumps(monitor.stats, ensure_ascii=False)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# web
+# ---------------------------------------------------------------------------
+def cmd_web(args: argparse.Namespace) -> int:
+    """Run the monitor behind a local web frontend.
+
+    The monitor owns the camera and the SQLite writer, so it runs on a background thread while
+    the HTTP server keeps the main thread -- that is what lets ``/api/events`` stream live
+    events.  Because the camera can only be opened once, this replaces ``run`` rather than
+    complementing it; ``--no-monitor`` serves the UI alone when a monitor already runs elsewhere.
+    """
+    cfg = load_config(args.config, _overrides(args))
+    from .webui import EventBus, WebApp, serve
+
+    bus = EventBus()
+    monitor = None
+    if not args.no_monitor:
+        from .monitor import Monitor
+
+        asr, speaker = _make_engines(cfg)
+        monitor = Monitor(cfg, asr=asr, speaker=speaker)
+
+    app = WebApp(cfg, monitor=monitor, bus=bus)
+    if monitor is not None:
+        app.start_monitor(max_ticks=args.max_ticks, duration_s=args.duration)
+    try:
+        serve(app, host=args.host, port=args.port)
+    finally:
+        if monitor is not None:
+            monitor.stop()
+            app.join_monitor(timeout=5.0)
     return 0
 
 
@@ -222,7 +274,36 @@ def cmd_enroll(args: argparse.Namespace) -> int:
 
     collected: List[Any] = []
 
-    if args.image:
+    if args.from_frames:
+        # Enrol from frames the monitor already saved.  This needs no camera, so it works while
+        # the agent is running -- and the samples come from the same distribution (same camera,
+        # same lighting) that recognition will actually see.
+        from .imaging import decode_jpeg
+
+        # The directory only exists once the monitor has saved a frame, so a fresh install has
+        # none -- say so rather than raising from os.listdir.
+        names = sorted((n for n in os.listdir(cfg.frames_dir) if n.endswith(".jpg")),
+                       key=lambda n: os.path.getmtime(os.path.join(cfg.frames_dir, n))) \
+            if os.path.isdir(cfg.frames_dir) else []
+        if not names:
+            print(f"no saved frames in {cfg.frames_dir}", file=sys.stderr)
+            return 3
+        for name in names[-int(args.from_frames):]:
+            path = os.path.join(cfg.frames_dir, name)
+            try:
+                with open(path, "rb") as fh:
+                    rgb = decode_jpeg(fh.read())
+            except Exception as exc:
+                print(f"{name}: {exc}", file=sys.stderr)
+                continue
+            faces = face.analyze(rgb)
+            if not faces:
+                continue
+            best = max(faces, key=lambda f: f.area)
+            if best.embedding is not None:
+                collected.append(best)
+                print(f"{name}: face {best.box} score {best.score:.2f}")
+    elif args.image:
         from .imaging import decode_jpeg
         from PIL import Image
 
@@ -270,6 +351,13 @@ def cmd_enroll(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 3
 
+    consistency = _face_consistency(collected)
+    if consistency is not None and consistency < cfg.face.match_threshold:
+        print(f"warning: the {len(collected)} samples agree with each other only at "
+              f"{consistency:.3f} (threshold {cfg.face.match_threshold}); they may not be the "
+              "same person, or the faces are too poor to enrol -- recognition will keep failing",
+              file=sys.stderr)
+
     with Memory(cfg, frames_dir=cfg.frames_dir) as mem:
         person = mem.person.ensure(args.name, notes=args.notes or "")
         for det in collected:
@@ -284,11 +372,30 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         counts = mem.person.embedding_counts(person.id)
 
     if args.json:
-        _print_json({"name": args.name, "faces": len(collected), **counts})
+        _print_json({"name": args.name, "faces": len(collected),
+                     "consistency": consistency, **counts})
     else:
+        detail = f", sample consistency {consistency:.3f}" if consistency is not None else ""
         print(f"enrolled {args.name}: {len(collected)} face embeddings, "
-              f"{counts['voices']} voiceprints")
+              f"{counts['voices']} voiceprints{detail}")
     return 0
+
+
+def _face_consistency(detections) -> Optional[float]:
+    """Median pairwise similarity among collected face embeddings, or ``None`` for < 2 samples.
+
+    A gallery is only as good as its samples.  If the crops do not agree with each other, the
+    person will never match at recognition time, and the failure looks like a detector bug rather
+    than an enrolment problem -- so it is worth saying out loud at enrol time.
+    """
+    from .vectors import cosine
+
+    embs = [d.embedding for d in detections if d.embedding is not None]
+    if len(embs) < 2:
+        return None
+    sims = sorted(float(cosine(embs[i], embs[j]))
+                  for i in range(len(embs)) for j in range(i + 1, len(embs)))
+    return sims[len(sims) // 2]
 
 
 def _capture_voiceprint(cfg, seconds: float):
@@ -624,6 +731,35 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as exc:
         add("memory", False, str(exc))
 
+    # 9. text endpoint used for the hourly summary
+    if cfg.llm.text_url:
+        text_client = LLMClient(url=cfg.llm.text_url, timeout=min(cfg.llm.timeout, 10.0))
+        try:
+            try:
+                name = text_client.health().get("model")
+            except LLMError:
+                name = None
+            if not name:
+                # llama.cpp's /health carries no model field; /v1/models does.
+                ids = text_client.models()
+                name = ids[0] if ids else "?"
+            add("summary-llm", True, f"{cfg.llm.text_url} -> {name}")
+        except LLMError as exc:
+            add("summary-llm", False, f"{cfg.llm.text_url} unreachable: {exc}", critical=False)
+    else:
+        add("summary-llm", True, "not set; summaries will use the vision engine", critical=False)
+
+    # 10. text-to-speech
+    try:
+        from .tts import make_engine
+
+        engine = make_engine(cfg)
+        add("tts", engine is not None,
+            engine.describe() if engine else f"backend={cfg.tts.backend} is not usable",
+            critical=False)
+    except Exception as exc:
+        add("tts", False, str(exc), critical=False)
+
     ok_all = all(c["ok"] or not c["critical"] for c in checks)
     if args.json:
         _print_json({"ok": ok_all, "checks": checks})
@@ -637,12 +773,105 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# speak / summary
+# ---------------------------------------------------------------------------
+def cmd_speak(args: argparse.Namespace) -> int:
+    """Synthesize one line and play it -- the fastest way to check the whole audio path."""
+    cfg = load_config(args.config, _overrides(args))
+    from .tts import make_engine
+
+    engine = make_engine(cfg, on_error=lambda msg: print(f"tts: {msg}", file=sys.stderr))
+    if engine is None:
+        print("tts unavailable: no usable backend or player "
+              f"(backend={cfg.tts.backend}, player={cfg.tts.player})", file=sys.stderr)
+        return 1
+
+    text = args.text or "这是一条测试播报。"
+    ok = engine.say(text)
+    if args.json:
+        _print_json({"ok": ok, "backend": engine.backend, "player": engine.player,
+                     "voice": engine.voice, "text": text, "error": engine.last_error})
+    else:
+        print(f"{'played' if ok else 'failed'}: {engine.describe()}")
+        if not ok and engine.last_error:
+            print(f"  last error: {engine.last_error}", file=sys.stderr)
+    return 0 if ok else 1
+
+
+def cmd_summary(args: argparse.Namespace) -> int:
+    """Build one hourly summary on demand, from whatever is already in memory."""
+    cfg = load_config(args.config, _overrides(args))
+    from .agent import Agent
+    from .memory import Memory
+    from .summary import HourlySummarizer
+    from .tts import make_engine
+
+    window = args.window if args.window is not None else cfg.summary.window_s
+    engine = make_engine(cfg) if args.say else None
+
+    with Memory(cfg) as mem:
+        summarizer = HourlySummarizer(cfg, Agent(cfg))
+        result = summarizer.summarize(mem, time.time(), window_s=window)
+
+    if args.json:
+        _print_json(result.as_dict())
+    else:
+        state = "quiet" if result.quiet else ("ok" if result.ok else "failed")
+        print(f"summary ({state}, {result.items} items, window {int(result.window_s)}s): "
+              f"{result.text or result.error}")
+    if engine is not None and result.ok and result.text:
+        engine.say(result.text)
+    return 0 if result.ok else 1
+
+
+# ---------------------------------------------------------------------------
 # parser
 # ---------------------------------------------------------------------------
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--config", default=None, help="path to a YAML config (default: configs/default.yaml)")
     p.add_argument("--db", default=None, help="memory database path")
     p.add_argument("--json", action="store_true", help="machine-readable output")
+
+
+def _add_run_flags(p: argparse.ArgumentParser) -> None:
+    """The perception and broadcast flags shared by ``run`` and ``web``."""
+    p.add_argument("--url", default=None, help="qwen25vl-lite serve URL")
+    p.add_argument("--device", type=int, default=None, help="camera /dev/video<N>")
+    p.add_argument("--width", type=int, default=None, help="capture width")
+    p.add_argument("--rotate", type=int, default=None, choices=[0, 90, 180, 270],
+                   help="clockwise rotation applied to each frame (fixes an inverted mount)")
+    p.add_argument("--interval", type=float, default=None, help="perception tick interval (s)")
+    p.add_argument("--describe-interval", type=float, default=None,
+                   help="seconds between VL scene descriptions")
+    p.add_argument("--max-vision-tokens", type=int, default=None,
+                   help="request-level image budget (server --vision-tier does not change pixels)")
+    p.add_argument("--max-tokens", type=int, default=None, help="max tokens per agent reply")
+    p.add_argument("--timeout", type=float, default=None, help="HTTP timeout per agent call")
+    p.add_argument("--text-url", default=None,
+                   help="text-only endpoint for the hourly summary (e.g. the local Qwen3.5-4B)")
+    p.add_argument("--text-model", default=None, help="model name on the text endpoint")
+    p.add_argument("--summary-interval", type=float, default=None,
+                   help="seconds between hourly broadcasts")
+    p.add_argument("--summary-window", type=float, default=None,
+                   help="seconds of memory each summary reads")
+    p.add_argument("--no-summary", action="store_true", help="disable the hourly summary")
+    p.add_argument("--speak", dest="speak", action="store_true", default=None,
+                   help="read each summary aloud")
+    p.add_argument("--no-speak", dest="speak", action="store_false",
+                   help="write summaries but stay silent")
+    p.add_argument("--no-tts", action="store_true", help="disable text-to-speech entirely")
+    p.add_argument("--tts-backend", default=None,
+                   choices=["auto", "piper", "edge", "espeak", "spd-say", "command", "none"])
+    p.add_argument("--tts-voice", default=None, help="edge voice name (or piper .onnx path)")
+    p.add_argument("--tts-player", default=None, help="audio player, e.g. pw-play")
+    p.add_argument("--audio-device", default=None, help="arecord device, e.g. plughw:1,0")
+    p.add_argument("--no-audio", action="store_true", help="disable audio/ASR entirely")
+    p.add_argument("--asr-backend", default=None, choices=["funasr", "none"])
+    p.add_argument("--speaker-backend", default=None, choices=["funasr", "none"])
+    p.add_argument("--no-save-frames", dest="save_frames", action="store_false", default=None)
+    p.add_argument("--max-ticks", type=int, default=0, help="stop after N ticks (testing)")
+    p.add_argument("--duration", type=float, default=0.0, help="stop after N seconds (testing)")
+    p.add_argument("--verbose", action="store_true", help="also print tick-level events")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -657,25 +886,18 @@ def build_parser() -> argparse.ArgumentParser:
     # run
     p = sub.add_parser("run", help="start the 24/7 monitoring loop")
     _add_common(p)
-    p.add_argument("--url", default=None, help="qwen25vl-lite serve URL")
-    p.add_argument("--device", type=int, default=None, help="camera /dev/video<N>")
-    p.add_argument("--width", type=int, default=None, help="capture width")
-    p.add_argument("--interval", type=float, default=None, help="perception tick interval (s)")
-    p.add_argument("--describe-interval", type=float, default=None,
-                   help="seconds between VL scene descriptions")
-    p.add_argument("--max-vision-tokens", type=int, default=None,
-                   help="request-level image budget (server --vision-tier does not change pixels)")
-    p.add_argument("--max-tokens", type=int, default=None, help="max tokens per agent reply")
-    p.add_argument("--timeout", type=float, default=None, help="HTTP timeout per agent call")
-    p.add_argument("--audio-device", default=None, help="arecord device, e.g. plughw:1,0")
-    p.add_argument("--no-audio", action="store_true", help="disable audio/ASR entirely")
-    p.add_argument("--asr-backend", default=None, choices=["funasr", "none"])
-    p.add_argument("--speaker-backend", default=None, choices=["funasr", "none"])
-    p.add_argument("--no-save-frames", dest="save_frames", action="store_false", default=None)
-    p.add_argument("--max-ticks", type=int, default=0, help="stop after N ticks (testing)")
-    p.add_argument("--duration", type=float, default=0.0, help="stop after N seconds (testing)")
-    p.add_argument("--verbose", action="store_true", help="also print tick-level events")
+    _add_run_flags(p)
     p.set_defaults(func=cmd_run)
+
+    # web
+    p = sub.add_parser("web", help="run the monitor with a local web frontend")
+    _add_common(p)
+    _add_run_flags(p)
+    p.add_argument("--host", default=None, help="bind address (default: configs web.host)")
+    p.add_argument("--port", type=int, default=None, help="port (default: configs web.port = 8090)")
+    p.add_argument("--no-monitor", action="store_true",
+                   help="serve the UI only; do not start the monitor (frees the camera)")
+    p.set_defaults(func=cmd_web)
 
     # selftest
     p = sub.add_parser("selftest", help="short end-to-end run with a report")
@@ -699,6 +921,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--name", required=True, help="person name")
     p.add_argument("--image", nargs="+", default=None,
                    help="enroll from still image(s) instead of the camera")
+    p.add_argument("--from-frames", type=int, default=0,
+                   help="enroll from the N most recent saved frames (needs no camera)")
     p.add_argument("--device", type=int, default=None)
     p.add_argument("--frames", type=int, default=8, help="how many face samples to collect")
     p.add_argument("--seconds", type=float, default=15.0, help="capture time budget")
@@ -755,6 +979,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--url", default=None)
     p.add_argument("--device", type=int, default=None)
     p.set_defaults(func=cmd_doctor)
+
+    # speak
+    p = sub.add_parser("speak", help="synthesize one line and play it (audio path check)")
+    _add_common(p)
+    p.add_argument("text", nargs="?", default=None, help="what to say")
+    p.add_argument("--tts-backend", default=None,
+                   choices=["auto", "piper", "edge", "espeak", "spd-say", "command", "none"])
+    p.add_argument("--tts-voice", default=None)
+    p.add_argument("--tts-player", default=None)
+    p.set_defaults(func=cmd_speak)
+
+    # summary
+    p = sub.add_parser("summary", help="build one hourly summary now")
+    _add_common(p)
+    p.add_argument("--window", type=float, default=None, help="seconds of memory to read")
+    p.add_argument("--text-url", default=None, help="text-only endpoint to summarize with")
+    p.add_argument("--text-model", default=None)
+    p.add_argument("--say", action="store_true", help="also speak the summary")
+    p.add_argument("--no-tts", action="store_true")
+    p.set_defaults(func=cmd_summary)
 
     return parser
 

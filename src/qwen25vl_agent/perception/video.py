@@ -17,11 +17,24 @@ from typing import Optional
 
 import numpy as np
 
-__all__ = ["Frame", "CameraSource", "CameraUnavailable"]
+__all__ = ["Frame", "CameraSource", "CameraUnavailable", "rotate_frame"]
 
 
 class CameraUnavailable(RuntimeError):
     """OpenCV is missing, or the device cannot be opened."""
+
+
+def rotate_frame(rgb: np.ndarray, degrees: int) -> np.ndarray:
+    """Rotate clockwise by 0/90/180/270 degrees.
+
+    Returns a contiguous array: downstream consumers hand this straight to OpenCV and YuNet,
+    which dislike non-contiguous views, and ``np.rot90`` returns exactly such a view.
+    """
+    quarter = (int(degrees) // 90) % 4
+    if quarter == 0:
+        return rgb
+    # np.rot90 counts counter-clockwise, so a clockwise turn is the negative.
+    return np.ascontiguousarray(np.rot90(rgb, k=(-quarter) % 4))
 
 
 @dataclass
@@ -41,6 +54,7 @@ class CameraSource:
     device: int = 0
     width: int = 640
     height: int = 480
+    rotate: int = 0                # degrees clockwise, applied to every frame (0/90/180/270)
     reopen_backoff_s: float = 1.0
     max_backoff_s: float = 30.0
 
@@ -123,8 +137,9 @@ class CameraSource:
 
         self._failures = 0
         self._index += 1
+        rgb = rotate_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), self.rotate)
         return Frame(
-            rgb=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+            rgb=rgb,
             ts=time.time(),
             index=self._index,
             camera_ts=time.monotonic(),

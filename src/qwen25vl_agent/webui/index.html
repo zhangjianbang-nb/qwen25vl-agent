@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qwen25vl-agent 监控台</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e2230; --line: #2a2f3d;
+    --fg: #e6e8ee; --dim: #9aa2b1; --accent: #4f8cff;
+    --ok: #35c46b; --warn: #e0a13a; --bad: #e5534b;
+    --scene: #6ea8fe; --speech: #35c46b; --person: #c58af9; --alert: #e5534b;
+    --summary: #e0a13a; --error: #ff7b72; --tick: #7d8590;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.5 -apple-system, "Segoe UI", "Noto Sans SC", sans-serif; }
+  a { color: var(--accent); }
+  header { display: flex; align-items: center; gap: 16px; padding: 10px 16px;
+           background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .pills { display: flex; gap: 8px; flex-wrap: wrap; }
+  .pill { padding: 3px 10px; border-radius: 999px; font-size: 12px;
+          background: var(--panel2); border: 1px solid var(--line); color: var(--dim); }
+  .pill.ok { color: var(--ok); border-color: #24503a; }
+  .pill.bad { color: var(--bad); border-color: #5a2724; }
+  .spacer { flex: 1; }
+  #preview { width: 160px; height: 120px; object-fit: cover; border-radius: 6px;
+             border: 1px solid var(--line); background: #000; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+          display: flex; flex-direction: column; min-height: 0; }
+  .card h2 { font-size: 13px; margin: 0; padding: 10px 12px; color: var(--dim);
+             border-bottom: 1px solid var(--line); font-weight: 600;
+             display: flex; align-items: center; gap: 8px; }
+  .card h2 .spacer { flex: 1; }
+  #feed { overflow-y: auto; height: calc(100vh - 320px); padding: 6px 0; }
+  .ev { display: grid; grid-template-columns: 64px 74px 1fr; gap: 8px;
+        padding: 4px 12px; border-bottom: 1px solid #1c202b; font-size: 13px; }
+  .ev .t { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .ev .k { text-transform: uppercase; font-size: 11px; font-weight: 700; letter-spacing: .3px; }
+  .ev.scene .k { color: var(--scene); } .ev.speech .k { color: var(--speech); }
+  .ev.person .k { color: var(--person); } .ev.alert .k { color: var(--alert); }
+  .ev.summary .k { color: var(--summary); } .ev.error .k { color: var(--error); }
+  .ev.tick .k { color: var(--tick); }
+  .ev.alert { background: #2a1a19; }
+  .tabs { display: flex; gap: 4px; padding: 8px 12px 0; flex-wrap: wrap; }
+  .tab { padding: 4px 10px; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 13px;
+         color: var(--dim); border: 1px solid transparent; border-bottom: none; }
+  .tab.active { background: var(--panel2); color: var(--fg); border-color: var(--line); }
+  .tabbody { overflow-y: auto; height: calc(100vh - 320px); padding: 10px 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid #1c202b;
+           vertical-align: top; }
+  th { color: var(--dim); font-weight: 600; font-size: 12px; }
+  code, .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+  .muted { color: var(--dim); }
+  footer { padding: 10px 16px; background: var(--panel); border-top: 1px solid var(--line);
+           display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  input[type=text], input[type=file], select { background: var(--panel2); color: var(--fg);
+           border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 13px; }
+  input[type=text] { min-width: 260px; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+           padding: 6px 12px; font-size: 13px; cursor: pointer; }
+  button.ghost { background: var(--panel2); color: var(--fg); border: 1px solid var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
+  .toast { position: fixed; right: 16px; bottom: 70px; background: var(--panel2);
+           border: 1px solid var(--line); border-left: 3px solid var(--accent);
+           padding: 8px 12px; border-radius: 6px; max-width: 380px; font-size: 13px; }
+  .toast.bad { border-left-color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>qwen25vl-agent 监控台</h1>
+  <div class="pills" id="pills"></div>
+  <div class="spacer"></div>
+  <img id="preview" alt="最新画面" title="最新画面">
+</header>
+
+<main>
+  <section class="card">
+    <h2>实时事件流 <span class="spacer"></span>
+        <span class="muted" id="feedcount"></span>
+        <button class="ghost" id="clearfeed">清空</button></h2>
+    <div id="feed"></div>
+  </section>
+
+  <section class="card">
+    <div class="tabs" id="tabs"></div>
+    <div class="tabbody" id="tabbody"><span class="muted">加载中…</span></div>
+  </section>
+</main>
+
+<footer>
+  <input type="text" id="speaktext" placeholder="要播报的话…" value="这是一条测试播报。">
+  <button id="speakbtn">说话</button>
+  <button class="ghost" id="summarybtn">立即播报本小时</button>
+  <span class="spacer"></span>
+  <button class="ghost" id="monitorbtn">—</button>
+  <input type="file" id="enrollimg" accept="image/*" title="注册人脸用的照片">
+  <input type="text" id="enrollname" placeholder="姓名" style="min-width:90px">
+  <button class="ghost" id="enrollbtn">注册</button>
+</footer>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const feed = $('#feed');
+let feedCount = 0;
+
+function toast(msg, bad) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (bad ? ' bad' : '');
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+async function api(path, opts) {
+  const resp = await fetch(path, opts);
+  const text = await resp.text();
+  let data;
+  try { data = JSON.parse(text); } catch (e) { data = { raw: text }; }
+  if (!resp.ok) throw new Error((data && data.error) || resp.status);
+  return data;
+}
+
+// ---- live feed (SSE) ------------------------------------------------------
+function addEvent(ev) {
+  const row = document.createElement('div');
+  row.className = 'ev ' + (ev.kind || '');
+  const t = document.createElement('span'); t.className = 't'; t.textContent = ev.time || '';
+  const k = document.createElement('span'); k.className = 'k'; k.textContent = ev.kind || '';
+  const m = document.createElement('span');
+  m.textContent = (ev.message || '') + (ev.importance ? `  (${ev.importance})` : '');
+  row.append(t, k, m);
+  feed.appendChild(row);
+  while (feed.childElementCount > 500) feed.removeChild(feed.firstChild);
+  feed.scrollTop = feed.scrollHeight;
+  feedCount += 1;
+  $('#feedcount').textContent = feedCount + ' 条';
+}
+
+function connect() {
+  const es = new EventSource('/api/events');
+  es.onmessage = (e) => { try { addEvent(JSON.parse(e.data)); } catch (err) {} };
+  es.onerror = () => { /* EventSource reconnects on its own */ };
+}
+connect();
+
+$('#clearfeed').onclick = () => { feed.innerHTML = ''; feedCount = 0; $('#feedcount').textContent = ''; };
+
+// ---- state pills ----------------------------------------------------------
+function pill(text, cls) { return `<span class="pill ${cls || ''}">${text}</span>`; }
+
+async function refreshState() {
+  let s;
+  try { s = await api('/api/state'); } catch (e) { $('#pills').innerHTML = pill('无法连接后端', 'bad'); return; }
+  const svc = s.services || {};
+  const mon = s.monitor || {};
+  const m = s.memory || {};
+  const pills = [
+    pill(mon.running ? '监控运行中' : '监控已停止', mon.running ? 'ok' : 'bad'),
+    pill('摄像头 ' + (s.config.camera || '?'), 'ok'),
+    pill('视觉 ' + (svc.llm && svc.llm.ok ? svc.llm.detail : '离线'), svc.llm && svc.llm.ok ? 'ok' : 'bad'),
+    pill('文本 ' + (svc.text && svc.text.ok ? svc.text.detail : '离线'), svc.text && svc.text.ok ? 'ok' : 'bad'),
+    pill('语音 ' + (s.config.tts || '?')),
+    pill(`记忆 ${m.persons ?? 0}人 / ${m.episodes ?? 0}情景 / ${m.facts ?? 0}事实`),
+  ];
+  if (mon.error) pills.push(pill('启动失败：' + String(mon.error).slice(0, 80), 'bad'));
+  $('#pills').innerHTML = pills.join('');
+  const btn = $('#monitorbtn');
+  btn.textContent = mon.running ? '停止监控' : '启动监控';
+  btn.dataset.running = mon.running ? '1' : '0';
+}
+
+setInterval(refreshState, 5000);
+refreshState();
+
+// ---- preview --------------------------------------------------------------
+setInterval(() => { $('#preview').src = '/api/latest.jpg?ts=' + Date.now(); }, 1000);
+
+// ---- tabs -----------------------------------------------------------------
+const TABS = ['persons', 'episodes', 'facts', 'rules', 'stats', 'search'];
+const LABELS = { persons: '人物', episodes: '情景', facts: '事实', rules: '规则', stats: '统计', search: '搜索' };
+let activeTab = 'persons';
+
+function renderTabs() {
+  $('#tabs').innerHTML = TABS.map((t) =>
+    `<div class="tab ${t === activeTab ? 'active' : ''}" data-tab="${t}">${LABELS[t]}</div>`).join('');
+  document.querySelectorAll('.tab').forEach((el) => {
+    el.onclick = () => { activeTab = el.dataset.tab; renderTabs(); loadTab(); };
+  });
+}
+
+function esc(v) { return String(v == null ? '' : v).replace(/[&<>"]/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+async function loadTab() {
+  const body = $('#tabbody');
+  body.innerHTML = '<span class="muted">加载中…</span>';
+  try {
+    if (activeTab === 'persons') {
+      const rows = await api('/api/persons');
+      body.innerHTML = rows.length ? table(['id', '姓名', '人脸', '声纹', '见过', '最近'], rows.map((p) =>
+        [p.id, esc(p.name), p.faces, p.voices, p.seen_count, fmtTime(p.last_seen)]))
+        : '<span class="muted">还没有注册的人（用底栏的“注册”）。</span>';
+    } else if (activeTab === 'episodes') {
+      const rows = await api('/api/episodes?limit=80');
+      body.innerHTML = rows.length ? table(['时间', '类型', '重要度', '摘要'], rows.map((e) =>
+        [fmtTime(e.ts), esc(e.kind), (e.importance || 0).toFixed(2), esc(e.summary)]))
+        : '<span class="muted">还没有情景记忆。</span>';
+    } else if (activeTab === 'facts') {
+      const rows = await api('/api/facts?limit=100');
+      body.innerHTML = rows.length ? table(['主语', '关系', '宾语', '置信', '来源'], rows.map((f) =>
+        [esc(f.subject), esc(f.predicate), esc(f.object), (f.confidence || 0).toFixed(2), esc(f.source)]))
+        : '<span class="muted">还没有语义事实。</span>';
+    } else if (activeTab === 'rules') {
+      const rows = await api('/api/rules');
+      body.innerHTML = rows.length ? table(['状态', '名称', '触发器', '动作', '冷却', '操作'], rows.map((r) => {
+        const on = r.enabled ? '开' : '关';
+        return [`<span class="${r.enabled ? '' : 'muted'}">${on}</span>`, esc(r.name),
+                `<code>${esc(JSON.stringify(r.trigger))}</code>`,
+                `<code>${esc(JSON.stringify(r.action))}</code>`, r.cooldown_s,
+                `<button class="ghost" data-rule="${esc(r.name)}" data-act="${r.enabled ? 'disable' : 'enable'}">${r.enabled ? '停用' : '启用'}</button>`];
+      })) : '<span class="muted">没有规则。</span>';
+      body.querySelectorAll('button[data-rule]').forEach((el) => {
+        el.onclick = async () => {
+          try { await api('/api/actions/rules', { method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: el.dataset.act, name: el.dataset.rule }) });
+            toast(`${el.dataset.act === 'enable' ? '已启用' : '已停用'} ${el.dataset.rule}`);
+            loadTab();
+          } catch (e) { toast('规则操作失败：' + e.message, true); }
+        };
+      });
+    } else if (activeTab === 'stats') {
+      const s = await api('/api/state');
+      const kv = Object.entries(s.memory || {}).map(([k, v]) =>
+        `<tr><th>${esc(k)}</th><td class="mono">${esc(typeof v === 'object' ? JSON.stringify(v) : v)}</td></tr>`).join('');
+      const st = Object.entries((s.monitor && s.monitor.stats) || {}).map(([k, v]) =>
+        `<tr><th>${esc(k)}</th><td class="mono">${esc(v)}</td></tr>`).join('');
+      body.innerHTML = `<h3 style="font-size:13px;color:var(--dim)">记忆库</h3><table>${kv}</table>`
+        + `<h3 style="font-size:13px;color:var(--dim);margin-top:14px">监控计数</h3><table>${st}</table>`;
+    } else if (activeTab === 'search') {
+      body.innerHTML = `<div style="display:flex;gap:8px;margin-bottom:10px">
+        <input type="text" id="q" placeholder="搜索情景与事实…" style="flex:1">
+        <button id="qbtn">搜索</button></div><div id="qres"><span class="muted">输入关键词后回车。</span></div>`;
+      const run = async () => {
+        const q = $('#q').value.trim();
+        if (!q) return;
+        try {
+          const r = await api('/api/search?q=' + encodeURIComponent(q));
+          $('#qres').innerHTML = (r.episodes.length || r.facts.length)
+            ? `<h3 style="font-size:13px;color:var(--dim)">情景</h3>`
+              + table(['时间', '摘要'], r.episodes.map((e) => [fmtTime(e.ts), esc(e.summary)]))
+              + `<h3 style="font-size:13px;color:var(--dim);margin-top:12px">事实</h3>`
+              + table(['主语', '关系', '宾语'], r.facts.map((f) => [esc(f.subject), esc(f.predicate), esc(f.object)]))
+            : '<span class="muted">没有匹配。</span>';
+        } catch (e) { $('#qres').innerHTML = '<span class="muted">搜索失败：' + esc(e.message) + '</span>'; }
+      };
+      $('#qbtn').onclick = run;
+      $('#q').onkeydown = (ev) => { if (ev.key === 'Enter') run(); };
+    }
+  } catch (e) {
+    body.innerHTML = '<span class="muted">加载失败：' + esc(e.message) + '</span>';
+  }
+}
+
+function table(head, rows) {
+  return '<table><thead><tr>' + head.map((h) => `<th>${h}</th>`).join('') + '</tr></thead><tbody>'
+    + rows.map((r) => '<tr>' + r.map((c) => `<td>${c}</td>`).join('') + '</tr>').join('')
+    + '</tbody></table>';
+}
+
+renderTabs();
+loadTab();
+
+// ---- actions --------------------------------------------------------------
+$('#speakbtn').onclick = async () => {
+  const text = $('#speaktext').value.trim();
+  if (!text) return;
+  try {
+    const r = await api('/api/actions/speak', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+    toast(r.ok ? `已交给 TTS（${r.backend}）` : 'TTS 不可用：' + (r.error || ''), !r.ok);
+  } catch (e) { toast('说话失败：' + e.message, true); }
+};
+
+$('#summarybtn').onclick = async () => {
+  toast('正在生成本小时播报…');
+  try {
+    const r = await api('/api/actions/summary', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ say: true }) });
+    toast(r.quiet ? '本小时无内容，跳过播报。' : (r.ok ? '播报：' + r.text : '播报失败：' + (r.error || '')), !r.ok && !r.quiet);
+  } catch (e) { toast('播报失败：' + e.message, true); }
+};
+
+$('#monitorbtn').onclick = async () => {
+  const running = $('#monitorbtn').dataset.running === '1';
+  try {
+    const r = await api('/api/actions/monitor', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: running ? 'stop' : 'start' }) });
+    toast(r.ok ? (running ? '已请求停止监控' : '已启动监控') : '操作未生效（可能已在运行或未启用监控）', !r.ok);
+    refreshState();
+  } catch (e) { toast('监控操作失败：' + e.message, true); }
+};
+
+$('#enrollbtn').onclick = async () => {
+  const name = $('#enrollname').value.trim();
+  const file = $('#enrollimg').files[0];
+  if (!name) return toast('请填姓名', true);
+  if (!file) return toast('请选择一张照片', true);
+  const dataUrl = await new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(fr.result);
+    fr.onerror = rej;
+    fr.readAsDataURL(file);
+  });
+  toast('正在注册 ' + name + '…');
+  try {
+    const r = await api('/api/actions/enroll', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, image: dataUrl }) });
+    toast(r.ok ? `已注册 ${r.name}：${r.faces} 个人脸特征，${r.voices} 个声纹` : '注册失败：' + (r.error || ''), !r.ok);
+    if (r.ok && activeTab === 'persons') loadTab();
+  } catch (e) { toast('注册失败：' + e.message, true); }
+};
+</script>
+</body>
+</html>

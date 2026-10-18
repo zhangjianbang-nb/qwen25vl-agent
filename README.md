@@ -1,7 +1,8 @@
 # qwen25vl-agent
 
 一个 **24 小时摄像头监控智能体**：从摄像头读视频、从麦克风读语音、做人脸与声纹识别，用一个
-本地小模型（Qwen2.5-VL）理解画面，并把看到和听到的一切写进一个五段式多模态记忆库。
+本地小模型（Qwen2.5-VL）理解画面，并把看到和听到的一切写进一个五段式多模态记忆库；
+**每小时**再由第二个本地模型（Qwen3.5-4B）把这一小时总结成几句话，用 TTS 念出来。
 
 它不是一个"调用一次就结束"的脚本，而是一个长跑进程：掉帧、摄像头掉线、模型调用失败、
 模型输出解析不出来，都只会让**当前这一 tick 降级**，下一 tick 照常继续。24/7 的前提是不因为
@@ -9,7 +10,7 @@
 
 ---
 
-## 一、架构：四层
+## 一、架构：五层
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -51,6 +52,16 @@
 │   双线程：音频线程做 VAD→ASR→声纹；主线程做取帧→人脸→融合→推理→写记忆     │
 │   →规则评估→归档。所有 SQLite 写都在主线程（连接不跨线程共享）             │
 │   每小时一次归档：老数据落 JSONL，再按大小预算裁剪，24/7 不会撑爆磁盘       │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  每小时播报 summary.py + tts.py                                           │
+│                                                                          │
+│   summary.py  取最近一小时的情景/语音/告警，交给文本模型 Qwen3.5-4B 总结    │
+│               结果写回情景记忆（kind=hourly_summary），下一窗口排除它       │
+│   tts.py      edge-tts / piper / espeak 合成，pw-play/aplay 播放           │
+│               合成与播放都在一个 worker 线程，两秒语音不阻塞 tick 循环       │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -128,6 +139,32 @@ JSON 对象、字段固定、每个字段都可选、空数组是明确合法答
 JSONL 是刻意选的格式：追加式、一行一条、能直接用 `grep` 读。一年后这个包没了，归档还能用
 `grep` 打开。
 
+### 5. 每小时播报：第二个模型 + TTS
+
+每满 `summary.interval_s`（默认 3600s）就跑一次播报，和归档是**两个独立时钟**，免得一次慢归档
+把播报时间推歪：
+
+1. `summary.py` 从记忆里取最近一小时的情景、语音、告警和出现的人，渲染成一份紧凑的中文清单
+   （不是原始 JSON——小模型从整齐的清单里总结得更稳，整段提示词还压了 4000 字上限）；
+2. 这份清单交给**文本模型** `llm.text_url`（默认 `http://127.0.0.1:8082` 上的 Qwen3.5-4B）；
+3. 总结写回情景记忆，`kind=hourly_summary`；
+4. 如果 `summary.speak` 打开且 TTS 可用，把这句话交给 `tts.py` 念出来。
+
+三个关键设计：
+
+- **排除上一次总结**：下一窗口读记忆时会跳过 `hourly_summary`，否则每小时都在总结上一小时的
+  总结，安静的一小时永远读不成"安静"。
+- **安静不播报**：窗口里条目少于 `summary.min_items`（默认 1）就直接跳过，连模型都不调——
+  每小时播报一遍"没有异常"比不说话更烦。
+- **降级不抛异常**：文本模型挂了就退回视觉引擎（它也能写散文）；两个都挂、TTS 挂了、播放器没有，
+  都只让这次播报失败，下一小时照常。
+
+TTS 后端按 `auto` 的顺序挑第一个可用的：`piper`（本地、离线、需要 voice `.onnx`）→ `edge`
+（`edge-tts`，中文质量最好但**播报时需要联网**）→ `espeak`（离线、机器人腔）→ `spd-say`。
+播放器挑第一个可用的 `pw-play`/`paplay`/`ffplay`/`aplay`；`aplay` 只认 WAV，所以 `edge` 产出的
+MP3 会先经 `soundfile` 转成 WAV 再播。想用别的后端：`tts.backend: command` 加一个
+`command` 模板（含 `{text}` 和 `{out}`）。
+
 ---
 
 ## 二、安装
@@ -139,7 +176,14 @@ scripts/fetch_models.sh
 # 2. 安装包（含 ASR/声纹需要的 funasr）
 pip install -e '.[asr]'
 
-# 3. 体检
+# 3. 播报用的文本模型权重（GGUF，约 2.7GB）
+modelscope download --model unsloth/Qwen3.5-4B-GGUF \
+  --local-dir ~/models/Qwen3.5-4B-GGUF Qwen3.5-4B-Q4_K_M.gguf
+
+# 4. TTS 后端（edge-tts 是 pip 包；piper/espeak 是系统二进制）
+pip install edge-tts
+
+# 5. 体检
 qwen25vl-agent doctor
 ```
 
@@ -154,15 +198,20 @@ qwen25vl-agent doctor
 [ok  ] speaker        funasr present
 [ok  ] disk           1553.8 GB free for ~/.qwen25vl-agent/memory.db
 [ok  ] memory         1 people, 2 episodes, 1 facts
+[ok  ] summary-llm    http://127.0.0.1:8082 -> Qwen3.5-4B
+[ok  ] tts            backend=edge player=pw-play voice=zh-CN-XiaoxiaoNeural
 overall: ready
 ```
 
-`llm`、`camera`、`memory` 是 critical；`face`、`audio-devices`、`asr`、`speaker` 缺失只是 warn，
-agent 会降级到它能做的部分。
+`llm`、`camera`、`memory` 是 critical；`face`、`audio-devices`、`asr`、`speaker`、`summary-llm`、`tts`
+缺失只是 warn，agent 会降级到它能做的部分（没有 `summary-llm` 就用视觉引擎总结，没有 TTS 就只写
+不念）。
 
-### 前置：一个在跑的推理引擎
+### 前置：两个在跑的推理引擎
 
-agent 不自带模型，需要先起 `qwen25vl-lite serve`：
+agent 不自带模型，需要先起两个服务：
+
+**视觉引擎**（每 tick 描述画面）：
 
 ```bash
 qwen25vl-lite serve --model /path/to/Qwen2.5-VL-3B-Instruct --device cuda \
@@ -171,6 +220,23 @@ qwen25vl-lite serve --model /path/to/Qwen2.5-VL-3B-Instruct --device cuda \
 
 地址用 `configs/default.yaml` 的 `llm.url` 或 `--url` 指定。
 
+**文本引擎**（每小时写播报）。权重是 GGUF，直接用本机 llama.cpp 的 `llama-server`：
+
+```bash
+scripts/serve_qwen35.sh          # CPU，127.0.0.1:8082
+```
+
+为什么是 CPU：8GB 卡已经被视觉模型占了约 6GB，装不下 4B。而播报是**一小时一次、几百 token** 的
+活，CPU 上实测约 2.7 tok/s，一次总结约 20-35 秒——完全够，且完全不碰显存。想让它上 GPU 就
+`NGLAYERS=99 scripts/serve_qwen35.sh`（前提是显存真的空出来）。
+
+脚本里的 `--reasoning-budget 0` 和 `--chat-template-kwargs '{"enable_thinking":false}'` 是必要的：
+Qwen3.5 是**思考型**模型，不关思考时 `content` 会是空的、答案都落在 `reasoning_content` 里，而
+token 预算会被思考过程吃光。客户端也做了兜底——`content` 为空时自动回退到 `reasoning_content`
+（见 `llm.extract_text`），所以换成别的思考型端点也不会静默记下一条空播报。
+
+地址用 `llm.text_url` / `--text-url` 指定；设成 `null` 就退回用视觉引擎做总结。
+
 ---
 
 ## 三、快速开始
@@ -178,6 +244,9 @@ qwen25vl-lite serve --model /path/to/Qwen2.5-VL-3B-Instruct --device cuda \
 ```bash
 # 1. 注册一个人（人脸 + 声纹）。也可以直接用照片：
 qwen25vl-agent enroll --name 小明 --image ~/照片.jpg --audio-seconds 5
+
+# 镜头前的人不在、或者 monitor 正占着摄像头时，用已保存的帧注册（无需摄像头）：
+qwen25vl-agent enroll --name 小明 --from-frames 40
 
 # 2. 看注册结果
 qwen25vl-agent persons
@@ -191,6 +260,16 @@ qwen25vl-agent run
 # 5. 另开终端看记忆
 qwen25vl-agent mem --what stats
 qwen25vl-agent mem --what episodes --limit 20
+
+# 6. 手动跑一次播报（读现有记忆；--say 顺便念出来）
+qwen25vl-agent summary --say
+
+# 7. 只测音频通路（合成 + 播放）
+qwen25vl-agent speak "测试播报：系统正常。"
+
+# 8. 带一个网页前端跑（监控在后台线程，界面在主线程）
+qwen25vl-agent web                     # http://127.0.0.1:8090
+qwen25vl-agent web --no-monitor        # 只开界面，不占摄像头（监控已在别处跑时用）
 ```
 
 ---
@@ -200,20 +279,64 @@ qwen25vl-agent mem --what episodes --limit 20
 | 命令 | 作用 |
 | --- | --- |
 | `run` | 启动 24/7 监控循环 |
+| `web` | 带本地网页前端跑监控（实时事件流 + 记忆浏览 + 操作按钮） |
 | `selftest` | 短跑端到端并出报告 |
-| `enroll` | 注册一个人的人脸（可选声纹），支持 `--image` 用照片 |
+| `enroll` | 注册一个人的人脸（可选声纹），支持 `--image` 用照片、`--from-frames N` 用已保存的帧（无需摄像头） |
 | `voiceprint` | 给一个 wav 提声纹，或两个 wav 比对相似度 |
 | `transcribe` | 一次性语音识别（wav 文件或 `--mic N` 秒） |
 | `persons` | 列出已注册的人（`--history` 带交互记录） |
 | `mem` | 查看记忆：`--what stats/episodes/facts/rules/search/archive` |
 | `rules` | 管理程序记忆规则：`list/add/enable/disable/remove` |
+| `summary` | 立刻生成一次小时播报（`--window` 指定读多久，`--say` 念出来） |
+| `speak` | 合成一句话并播放，用来单独验音频通路 |
 | `doctor` | 依赖与就绪检查 |
 
 常用标志：`--config`（YAML 路径）、`--db`（记忆库路径）、`--json`（机器可读输出）、
 `--no-audio`（完全关掉音频）、`--asr-backend none`、`--speaker-backend none`。
 
 `run` 额外有 `--interval`、`--describe-interval`、`--max-vision-tokens`、`--no-save-frames`、
-`--max-ticks` / `--duration`（测试用）、`--verbose`。
+`--max-ticks` / `--duration`（测试用）、`--verbose`，以及播报相关的 `--text-url`、`--text-model`、
+`--summary-interval`、`--summary-window`、`--no-summary`、`--speak` / `--no-speak`、`--no-tts`、
+`--tts-backend`、`--tts-voice`、`--tts-player`。
+
+### Web 前端（`qwen25vl-agent web`）
+
+一个本地网页监控台，**纯标准库**（`http.server` + 单个 `index.html`），不引入任何 web 框架，
+和 `qwen25vl-lite` 自带 webui 的做法一致。默认监听 `127.0.0.1:8090`（`configs/default.yaml` 的
+`web.host` / `web.port` 可改，也可用 `--host` / `--port`）。
+
+```bash
+qwen25vl-agent web                      # 监控 + 界面
+qwen25vl-agent web --port 8090 --no-monitor   # 只开界面
+```
+
+**为什么监控跑在后台线程**：`Monitor.run()` 是阻塞的，且要独占摄像头和 SQLite 写连接。所以
+`web` 把监控放在 daemon 线程、HTTP 服务放在主线程，两者共享同一个 `Monitor` 实例——这样
+`/api/events` 才能把 `MonitorEvent` 实时推给浏览器。**代价是 `web` 会独占摄像头，此时不能再
+同时跑 `qwen25vl-agent run`**；`--no-monitor` 就是给"监控已在别的进程跑"这种情况留的口子。
+
+界面内容：
+
+- **顶栏状态灯**：监控是否在跑、摄像头、视觉引擎（8081）、文本引擎（8082）、TTS、记忆库行数；
+- **左栏实时事件流**：SSE 推送 `scene` / `speech` / `person` / `alert` / `summary` / `error`，带时间戳，按类型配色；
+- **右栏标签页**：人物（含人脸/声纹计数）、情景、事实、规则（可直接启停）、统计、搜索；
+- **右上最新帧缩略图**：每秒刷新 `/api/latest.jpg`（监控运行时是刚抓的那帧，按需编码；没监控时退回最新的存档帧）；
+- **底栏操作**：说话（测试 TTS）、立即播报本小时、启停监控、上传照片注册人脸。
+
+HTTP 接口（都在同一进程内，无鉴权，仅本机）：
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/` | 前端页面 |
+| GET | `/api/state` | 监控状态、计数、记忆库统计、两个引擎的健康 |
+| GET | `/api/events` | SSE 实时事件流（15s 心跳） |
+| GET | `/api/persons`、`/api/persons/<id>/history` | 人物与其交互记录 |
+| GET | `/api/episodes?limit&kind&since`、`/api/facts`、`/api/rules`、`/api/search?q` | 记忆查询 |
+| GET | `/api/latest.jpg`、`/api/frame/<name>` | 最新帧 / 存档帧（只接受裸文件名，防路径穿越） |
+| POST | `/api/actions/speak`、`/summary`、`/enroll`、`/rules`、`/monitor` | 动作 |
+
+读查询各自开一个短命 `Memory` 连接：WAL 允许它和监控的写连接并存，连接的 30s timeout 吸收
+两者短暂的写重叠。写动作（注册、改规则）是单个短事务 + 一把锁。
 
 ---
 
@@ -230,11 +353,24 @@ qwen25vl-agent mem --what episodes --limit 20
 | `llm.max_vision_tokens` | 128 | **请求体**字段，真正决定图像 token 预算；服务端 `--vision-tier` 只驱动 FastV 剪枝，不改像素 |
 | `monitor.tick_interval` | 0.5 | 感知节奏（人脸检测 + 工作记忆） |
 | `monitor.describe_interval` | 12.0 | 多久调一次视觉模型（一帧约 0.6s） |
+| `monitor.face_presence_merge_s` | 300.0 | 同一组人脸在窗口内重复出现就延长上一条 `face` episode 的 `t_end`，而不是再写一行（检测器在模糊帧上抖一下不该留下十几条一模一样的"1张未知人脸"） |
 | `audio.vad.start_db` | -32.0 | 绝对 dBFS 起说阈值。用绝对值而非相对噪声底，因为绝对值跨房间可预测，相对值会随噪声底估计漂移 |
 | `face.match_threshold` | 0.363 | SFace 官方公布的余弦阈值 |
 | `speaker.threshold` | 0.65 | 声纹余弦阈值 |
 | `identity.mode` | prefer_face | 人脸/声纹融合策略 |
 | `memory.archive_max_mb` | 2048 | 归档大小预算上限 |
+| `llm.text_url` | http://127.0.0.1:8082 | 播报用的文本模型端点；设 `null` 就退回用视觉引擎总结 |
+| `summary.interval_s` | 3600.0 | 多久播报一次（与归档时钟独立） |
+| `summary.retry_s` | 300.0 | 播报**失败**后多久重试。失败不该白等一整个小时：失败时把播报时钟回拨到 5 分钟后，而不是直接推进一小时 |
+| `summary.window_s` | 3600.0 | 每次读多久的记忆 |
+| `summary.min_items` | 1 | 窗口低于这个条数就跳过，不播报"没有异常" |
+| `summary.speak` | true | 是否把总结念出来 |
+| `tts.backend` | auto | 按 piper → edge → espeak → spd-say 挑第一个可用的；也可 `command`/`none` |
+| `tts.voice` | zh-CN-XiaoxiaoNeural | edge 音色名（`backend: piper` 时这里填 voice `.onnx` 路径） |
+| `tts.player` | auto | 按 pw-play → paplay → ffplay → aplay 挑第一个可用的 |
+| `tts.max_chars` | 400 | 单次播报字数上限，避免一小时的内容变成一小时音频 |
+| `web.host` | 127.0.0.1 | 前端绑定地址；默认只回环，因为它能注册人物和触发播报 |
+| `web.port` | 8090 | 前端端口，避开视觉 8081 / 文本 8082 |
 
 ---
 
@@ -249,12 +385,22 @@ qwen25vl-agent mem --what episodes --limit 20
 - **归档用 JSONL 不用压实**：归档步就是一条 SQL `DELETE` 加一次 JSONL 追加，不是压缩作业。
 - **SQLite + WAL**：24/7 写者加一个读者（CLI 在 agent 运行时查记忆）正是 WAL 的场景，读不阻塞写。
 - **模型不发明规则**：判断何时告警是确定性代码，模型只描述和总结，24/7 才可预测。
+- **播报用第二个模型，且跑 CPU**：总结是"文本进、文本出"，不需要视觉；把它放在 CPU 上，就
+  不必和占满显存的视觉模型抢资源。一小时一次、几百 token 的活，CPU 的 2.7 tok/s 够用。
+- **播报结果写回记忆但被下一窗口排除**：这样"每小时说了什么"有据可查，又不会让总结滚成
+  总结的总结。
+- **TTS 走系统播放器而不是 python 音频库**：机器上只有 PipeWire 的 `pw-play` 和 ALSA 的 `aplay`，
+  没有 sounddevice/pyaudio；用现成的播放器意味着不需要为放一句话再装一层音频栈。
 
 ---
 
 ## 七、已知限制
 
-- **单摄像头、单麦克风**：`camera.device` / `audio.device` 各一个。
+- **单摄像头、单麦克风**：`camera.device` / `audio.device` 各一个。因此 `qwen25vl-agent web`
+  会独占摄像头，**不能**和 `qwen25vl-agent run` 同时跑；要么用 `web` 一个命令代替 `run`，要么
+  用 `web --no-monitor` 只开界面。
+- **Web 前端无鉴权**：接口能注册人物、改规则、触发播报。默认只绑回环（`web.host`），
+  不要随手改成 `0.0.0.0` 暴露到局域网。
 - **ASR/声纹首次调用要下模型**：SenseVoice 约 940MB + CAM++，走 modelscope（国内网络比
   huggingface 可靠得多）。首次约 10s 加载，所以是**懒加载**，不在 import 时加载——24/7 agent
   重启不该在能看摄像头之前先付 10s。
@@ -271,9 +417,32 @@ qwen25vl-agent mem --what episodes --limit 20
   17 万行/天。保留期是 7 天，所以数据库约 120 万行；超期后由归档搬到 JSONL。磁盘总体有界
   （`archive_max_mb` 只限制归档目录，数据库由保留期限制），但如果想进一步降量，把
   `monitor.tick_interval` 调大即可。
+- **播报依赖两个外部服务**：文本模型（默认 8082）挂了会退回视觉引擎；两个都挂，这一小时的
+  播报就丢了——但记忆照写，事后可以用 `summary --window N` 补跑。TTS 挂了只是不念，总结照样
+  写进记忆。
+- **`auto` 会选到需要联网的 edge-tts**：机器上没装 piper 时，`auto` 挑的是 `edge`，播报时
+  需要访问微软的在线 TTS；网络不通就不出声。要完全离线，装 `piper` 并把 `tts.voice` 指向本地
+  voice `.onnx`。
 
 ---
 
-## 八、许可
+## 八、开发与测试
 
-Apache-2.0。推理引擎见 [qwen25vl-lite](https://github.com/zhangjianbang-nb/qwen25vl-lite)。
+测试是**自足**的：每个用例都把数据库、归档和告警日志指向 pytest 的临时目录，音频默认关闭，
+摄像头、人脸模型和推理服务要么被 fake 替换、要么跳过——不需要硬件，也不需要两个引擎在跑。
+
+```bash
+pip install -e '.[dev]'
+pytest
+```
+
+CI（`.github/workflows/ci.yml`）在 Python 3.10 / 3.12 上跑同样的路径：安装（`.[dev]`）、
+`compileall`、`pytest`，再加一条 CLI 冒烟。webui 的 `index.html` 由 `pyproject.toml` 的
+`package-data` 随包发布，安装后不需要额外的静态文件路径。
+
+---
+
+## 九、许可
+
+Apache-2.0（见 [LICENSE](LICENSE)）。推理引擎见
+[qwen25vl-lite](https://github.com/zhangjianbang-nb/qwen25vl-lite)。

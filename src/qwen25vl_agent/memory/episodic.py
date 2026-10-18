@@ -80,6 +80,19 @@ class EpisodicMemory:
         )
         return int(cur.lastrowid)
 
+    def extend(self, episode_id: int, *, t_end: Optional[float] = None) -> bool:
+        """Push an episode's end time forward, for something that is still going on.
+
+        Face presence is the case this exists for: one person sitting in frame is a single
+        episode whose ``t_end`` keeps moving, not one near-identical row per appearance.
+        """
+        t_end = t_end if t_end is not None else time.time()
+        cur = self.store.execute(
+            "UPDATE episodes SET t_end = ? WHERE id = ? AND (t_end IS NULL OR t_end < ?)",
+            (t_end, int(episode_id), t_end),
+        )
+        return bool(cur.rowcount)
+
     def observe(self, kind: str, text: str = "", *, payload: Optional[dict] = None,
                 person_ids: Optional[List[int]] = None, frame_path: Optional[str] = None,
                 ts: Optional[float] = None) -> int:
@@ -107,6 +120,35 @@ class EpisodicMemory:
         sql += " ORDER BY ts DESC LIMIT ?"
         params.append(int(limit))
         return [_row_to_episode(r) for r in self.store.query(sql, params)]
+
+    def observations(self, *, since: Optional[float] = None, kind: Optional[str] = None,
+                     limit: int = 200, desc: bool = False) -> List[dict]:
+        """Raw perception rows, oldest first by default.
+
+        Episodes are the distilled log; this is the unsummarized one.  The hourly summary reads
+        it for speech, which is recorded as an observation rather than an episode.  ``desc=True``
+        returns the newest rows instead, which is what a capped summary window wants: the tail of
+        a busy hour is more useful than its first 200 rows.
+        """
+        sql = "SELECT ts, kind, text, person_ids, payload, frame_path FROM observations WHERE 1=1"
+        params: list = []
+        if since is not None:
+            sql += " AND ts >= ?"
+            params.append(since)
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(kind)
+        sql += " ORDER BY ts DESC LIMIT ?" if desc else " ORDER BY ts ASC LIMIT ?"
+        params.append(int(limit))
+        return [
+            {
+                "ts": float(r["ts"]), "kind": r["kind"], "text": r["text"],
+                "person_ids": MemoryStore.loads(r["person_ids"], []),
+                "payload": MemoryStore.loads(r["payload"], {}),
+                "frame_path": r["frame_path"],
+            }
+            for r in self.store.query(sql, params)
+        ]
 
     def search(self, text: str, limit: int = 20) -> List[Episode]:
         like = f"%{text}%"

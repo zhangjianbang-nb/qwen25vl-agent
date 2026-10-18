@@ -159,6 +159,26 @@ def test_person_gallery_cache_is_invalidated_by_a_new_embedding(cfg):
         assert mem.person.match_face(np.ones(128, dtype=np.float32)).known
 
 
+def test_gallery_refresh_crosses_processes(cfg):
+    """Enrolment in another process must be visible without restarting the monitor.
+
+    ``enroll`` runs as its own process (it needs the camera, which the monitor may be holding),
+    so an in-process cache invalidation alone is not enough: the monitor would keep matching
+    against the gallery it loaded at startup and never recognise the newly enrolled person.
+    """
+    with Memory(cfg) as mem:
+        # Cache the gallery as empty first, so staleness would be observable.
+        assert not mem.person.match_face(np.ones(128, dtype=np.float32)).known
+
+        with Memory(cfg) as other:            # a second connection, as a second process would
+            person = other.person.ensure("建邦")
+            other.person.add_face(person, np.ones(128, dtype=np.float32))
+
+        hit = mem.person.match_face(np.ones(128, dtype=np.float32))
+        assert hit.known
+        assert hit.name == "建邦"
+
+
 # -- semantic memory --------------------------------------------------------------------------
 def test_semantic_upsert_keeps_the_max_confidence(cfg):
     with Memory(cfg) as mem:
@@ -279,3 +299,47 @@ def test_memory_seed_defaults_is_not_duplicated(cfg):
         assert mem.store.stats()["procedures"] == 4
     with Memory(cfg) as mem:
         assert mem.store.stats()["procedures"] == 4
+
+
+# -- the agent's context window ----------------------------------------------------------------
+def test_context_collapses_repeated_episodes(cfg):
+    """Ten identical "1张未知人脸" rows must not crowd out every scene and alert.
+
+    This was the live failure: a flickering unknown-face episode was rewritten on every tick, so
+    the eight episodes handed to the model were all the same sentence, and the model then echoed
+    that sentence back as its description.
+    """
+    with Memory(cfg) as mem:
+        for _ in range(10):
+            mem.episodic.record("face", "画面中出现：1张未知人脸")
+        mem.episodic.record("scene", "一个人坐在书桌前看书")
+        mem.episodic.record("alert", "陌生人出现在画面中", importance=0.8)
+
+        episodes = mem.context()["recent_episodes"]
+        summaries = [e["summary"] for e in episodes]
+
+        assert summaries.count("画面中出现：1张未知人脸") == 1     # collapsed to one
+        assert summaries.count("一个人坐在书桌前看书") == 1
+        assert "陌生人出现在画面中" in summaries                    # the alert survived
+
+
+def test_context_caps_each_kind(cfg):
+    """A busy stream cannot monopolise the budget: scenes are capped even when all are distinct."""
+    with Memory(cfg) as mem:
+        for i in range(6):
+            mem.episodic.record("scene", f"第{i}个不同的场景")
+        mem.episodic.record("face", "画面中出现：小明")
+
+        episodes = mem.context()["recent_episodes"]
+        assert sum(1 for e in episodes if e["kind"] == "scene") <= 4
+        assert any(e["kind"] == "face" for e in episodes)
+        assert len(episodes) <= 8
+
+
+def test_context_keeps_the_newest_of_each_kind(cfg):
+    with Memory(cfg) as mem:
+        for i in range(6):
+            mem.episodic.record("scene", f"场景{i}", ts=1000.0 + i)
+
+        scenes = [e for e in mem.context()["recent_episodes"] if e["kind"] == "scene"]
+        assert [e["summary"] for e in scenes] == ["场景5", "场景4", "场景3", "场景2"]

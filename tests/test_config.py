@@ -13,7 +13,9 @@ def test_committed_defaults_load():
     cfg = load_config()
     assert cfg.llm.url == "http://127.0.0.1:8081"
     assert cfg.camera.width == 640
-    assert cfg.audio.vad.start_db == -32.0
+    assert cfg.camera.rotate == 180            # this machine's camera is mounted upside-down
+    assert cfg.audio.device == "plughw:1,6"    # the DMIC array, not the empty analog jack
+    assert cfg.audio.vad.start_db == -40.0     # 10 dB above the measured -50 dBFS room floor
     assert cfg.identity.mode == "prefer_face"
     assert cfg.memory.working_size == 40
     assert cfg.monitor.describe_interval == 12.0

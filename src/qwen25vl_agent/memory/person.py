@@ -86,8 +86,8 @@ class PersonMemory:
         self.face_threshold = float(face_threshold)
         self.voice_threshold = float(voice_threshold)
         self.identity_mode = identity_mode
-        self._face_cache: Optional[Tuple[Tuple[int, ...], np.ndarray]] = None
-        self._voice_cache: Optional[Tuple[Tuple[int, ...], np.ndarray]] = None
+        self._face_cache: Optional[Tuple[Tuple[int, ...], np.ndarray, Tuple[int, int]]] = None
+        self._voice_cache: Optional[Tuple[Tuple[int, ...], np.ndarray, Tuple[int, int]]] = None
 
     # -- records ------------------------------------------------------------------
     def ensure(self, name: str, *, notes: str = "", ts: Optional[float] = None) -> Person:
@@ -148,27 +148,41 @@ class PersonMemory:
         self._invalidate()
         return int(cur.lastrowid)
 
-    def _load_gallery(self, table: str) -> Tuple[Tuple[int, ...], np.ndarray]:
+    def _gallery_signature(self, table: str) -> Tuple[int, int]:
+        """A cheap ``(count, max_id)`` fingerprint of an embedding table.
+
+        Enrolment usually happens in a *different* process from the monitor (``enroll`` needs the
+        camera, which the monitor may be holding), so an in-process cache invalidation is not
+        enough: a person enrolled while the monitor runs would be invisible until it restarted.
+        Comparing this fingerprint on every match costs one indexed query and makes enrolment
+        take effect immediately.
+        """
+        row = self.store.query_one(f"SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS m FROM {table}")
+        return (int(row["n"]), int(row["m"])) if row is not None else (0, 0)
+
+    def _load_gallery(self, table: str) -> Tuple[Tuple[int, ...], np.ndarray, Tuple[int, int]]:
         rows = self.store.query(f"SELECT person_id, vec FROM {table} ORDER BY id")
+        signature = self._gallery_signature(table)
         if not rows:
-            return (), np.zeros((0, 0), dtype=np.float32)
+            return (), np.zeros((0, 0), dtype=np.float32), signature
         ids = tuple(int(r["person_id"]) for r in rows)
         vecs = [unpack(r["vec"]) for r in rows]
         dim = max(v.size for v in vecs)
         matrix = np.zeros((len(vecs), dim), dtype=np.float32)
         for i, v in enumerate(vecs):
             matrix[i, : v.size] = v
-        return ids, matrix
+        return ids, matrix, signature
 
     def _gallery(self, modality: str) -> Tuple[Tuple[int, ...], np.ndarray]:
+        table = "face_embeddings" if modality == "face" else "voice_embeddings"
         cache = self._face_cache if modality == "face" else self._voice_cache
-        if cache is None:
-            cache = self._load_gallery("face_embeddings" if modality == "face" else "voice_embeddings")
+        if cache is None or cache[2] != self._gallery_signature(table):
+            cache = self._load_gallery(table)
             if modality == "face":
                 self._face_cache = cache
             else:
                 self._voice_cache = cache
-        return cache
+        return cache[0], cache[1]
 
     def _invalidate(self) -> None:
         self._face_cache = None
